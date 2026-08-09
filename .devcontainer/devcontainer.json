@@ -1,0 +1,46 @@
+{
+  "name": "llm_research",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "..",
+    "args": {
+      // "FLASH_ATTN_CUDA_ARCHS": "120" // Set the CUDA architectures for flash-attention build
+    }
+  },
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "mounts": [
+    "source=${localEnv:HOME}/.cache/huggingface,target=/root/.cache/huggingface,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.env,target=/root/.env,type=bind,consistency=cached"
+  ],
+  // "updateRemoteUserUID": true,
+  "overrideCommand": true,
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        //git
+        "mhutchie.git-graph",
+        "donjayamanne.githistory",
+        // python
+        "ms-python.vscode-pylance",
+        "ms-python.python",
+        "ms-python.debugpy",
+        "ms-python.vscode-python-envs",
+        "charliermarsh.ruff",
+        // bash
+        "foxundermoon.shell-format",
+        "yzhang.markdown-all-in-one"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/workspaces/.venv/bin/",
+        "shellformat.path": "/usr/bin/shfmt"
+      }
+    }
+  },
+  "postCreateCommand": "git config --global --add safe.directory ${containerWorkspaceFolder}; echo 'source /root/.env' >> /root/.bashrc;",
+  "runArgs": [
+    "--gpus",
+    "all",
+    "--shm-size",
+    "10.24gb"
+  ]
+}

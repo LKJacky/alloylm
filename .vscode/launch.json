@@ -1,0 +1,76 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "unittest",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "unittest",
+            "justMyCode": false,
+            "args": [
+                "-k=TestRLSystemQuick.test_rl"
+            ]
+        },
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "env": {
+                "HF_HUB_OFFLINE": "1"
+            }
+        },
+        {
+            "name": "Python: Debug Tests",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "purpose": [
+                "debug-test"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "HF_HUB_OFFLINE": "1"
+            }
+        },
+        {
+            "name": "compare_train_infer",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "tools/compare_train_infer.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--model=Qwen/Qwen2.5-0.5B-Instruct",
+                "--file=tests/resource/msgs.jsonl",
+                "--max-samples=4"
+            ]
+        },
+        {
+            "name": "sglang.launch_server",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sglang.launch_server",
+            "console": "integratedTerminal",
+            "args": [
+                "--model-path",
+                "Qwen/Qwen3-0.6B",
+                "--port",
+                "8000",
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.5",
+                "--context-length",
+                "10000"
+            ],
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "sglang_repo/python/:${PYTHONPATH}"
+            }
+        }
+    ]
+}

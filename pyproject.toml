@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling >= 1.26", "hatch-requirements-txt >= 0.4.1"]
+build-backend = "hatchling.build"
+
+[project]
+name = "alloylm"
+version = "0.1.0"
+description = "A self-contained framework for LLM training, inference, evaluation, and reinforcement learning."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dynamic = ["dependencies"]
+authors = [
+    { name = "LKJacky" },
+]
+keywords = [
+    "large-language-models",
+    "inference",
+    "reinforcement-learning",
+    "fsdp",
+    "distributed-training",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/LKJacky/alloylm"
+Repository = "https://github.com/LKJacky/alloylm"
+Issues = "https://github.com/LKJacky/alloylm/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["alloylm"]
+
+[tool.hatch.metadata.hooks.requirements_txt]
+files = ["requirements.txt"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["alloylm"]

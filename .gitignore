@@ -1,0 +1,16 @@
+/MODELS
+**/.env*
+/DATA
+**/__pycache__
+**/*.log
+**/task*.sh
+/ALLOYLM.egg-info
+**/.*.py
+**/checkpoints
+**/work_dirs
+**/data
+/eval/RULER/scripts/benchmark_root
+/eval/helmet/HELMET/
+**/*.egg-info
+**/save
+*_repo
