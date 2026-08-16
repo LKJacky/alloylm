@@ -1,4 +1,4 @@
-# syntax=docker.1ms.run/docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7
 
 FROM pytorch/pytorch:2.12.0-cuda13.0-cudnn9-devel
 
@@ -10,12 +10,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install -y \
     bash  curl git tar unzip zip \
     sudo procps rsync tree vim tmux
-
-# Install Node.js and AI tools
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && npm install -g @github/copilot @anthropic-ai/claude-code @openai/codex
-
 
 # Update and install essential dev packages
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -62,6 +56,12 @@ RUN if [ -n "${FLASH_ATTN_CUDA_ARCHS}" ]; then \
         unset FLASH_ATTN_CUDA_ARCHS; \
     fi \
     && NVCC_THREADS=4 MAX_JOBS=4 /workspaces/.venv/bin/pip install flash-attn --no-build-isolation
+
+# Install Node.js and AI tools
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g @github/copilot @anthropic-ai/claude-code @openai/codex
+RUN /workspaces/.venv/bin/pip install "hermes-node @ git+https://github.com/LKJacky/hermes_nodes.git#subdirectory=node"
 
 # Install Python dependencies
 # RUN pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
