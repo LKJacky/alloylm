@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: |
+  If you use this software, please cite it as below.
+title: "alloylm: A self-contained framework for LLM training, inference, evaluation, and reinforcement learning"
+abstract: |
+  alloylm is a self-contained framework for large language model (LLM)
+  training, inference, evaluation, and reinforcement learning. It provides
+  end-to-end infrastructure including FSDP-based distributed training,
+  SWA cache / sliding-window attention inference, tensor-parallel serving,
+  MoE routing with partial expert loading, and an RL engine that supports
+  rollout-routing replay for stabilizing MoE reinforcement learning.
+authors:
+  - family-names: "Liu"
+    given-names: "Kai"
+    orcid: ""
+    email: jackyliukai@outlook.com
+license: Apache-2.0
+version: 0.1.0
+date-released: "2026-08-26"
+url: "https://github.com/LKJacky/alloylm"
+repository-code: "https://github.com/LKJacky/alloylm"
+keywords:
+  - large-language-models
+  - inference
+  - reinforcement-learning
+  - fsdp
+  - distributed-training
+  - mixture-of-experts
+  - sliding-window-attention
