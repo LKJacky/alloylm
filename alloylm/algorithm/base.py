@@ -1,20 +1,45 @@
+import os
+from functools import partial
+
 import numpy as np
+from openai import AsyncClient
 from pydantic import BaseModel
 
 
 class InferArgs(BaseModel):
     model_url: str = "http://127.0.0.1:8000/v1"
     model_name: str = "ALLOYLM"
+    api_key: str = os.environ.get("OPENAI_API_KEY", "EMPTY")
 
     sample_args: dict = {
         "temperature": 1.0,
         "max_tokens": 2048,
         "top_p": 1.0,
         "extra_body": {
-            "top_k": 1,
+            # "top_k": 1, # an example
         },
     }
-    others: dict = {}
+    others: dict = {
+        # llm judger
+        # "llm_judger_infer_args": InferArgs= None
+    }
+
+    def model_dump(self, *args, **kwargs):
+        if "exclude" not in kwargs:
+            kwargs["exclude"] = {"api_key"}
+        else:
+            kwargs["exclude"] = list(kwargs["exclude"]) + ["api_key"]
+        return super().model_dump(*args, **kwargs)
+
+    def get_client(self, client_type=AsyncClient):
+        client = client_type(
+            base_url=self.model_url,
+            api_key=self.api_key,
+        )
+        client.chat.completions.create = partial(
+            client.chat.completions.create, model=self.model_name, **self.sample_args
+        )
+        return client
 
 
 class DatasetSummary(BaseModel):

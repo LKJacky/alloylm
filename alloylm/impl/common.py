@@ -51,13 +51,9 @@ class JsonlDatasetConfig(DatasetConfig):
 class OneStepTask(Task):
     @classmethod
     async def infer(cls, task_data: TaskData) -> TaskData:
-        client = AsyncClient(api_key="EMPTY", base_url=task_data.infer_args.model_url)
+        client = task_data.infer_args.get_client(client_type=AsyncClient)
         try:
-            response = await client.chat.completions.create(
-                model=task_data.infer_args.model_name,
-                messages=task_data.messages,
-                **task_data.infer_args.sample_args,
-            )
+            response = await client.chat.completions.create(messages=task_data.messages)
             task_data.messages.append({"role": "assistant", "content": response.choices[0].message.content})
 
             task_data.finish_reason = response.choices[0].finish_reason
@@ -126,7 +122,7 @@ class LLMVerifier:
                     f"{os.environ.get('LLM_JUDGER_URL', 'http://127.0.0.1:8000/v1')}/models",
                     headers={"Authorization": "Bearer "},
                 ).json()["data"][0]["id"]
-            except Exception:
+            except Exception:  # noqa
                 cls.LLM_JUDGER_NAME = "no llm judger"
         if cls.LLM_JUDGER_NAME == "no llm judger":
             return None
