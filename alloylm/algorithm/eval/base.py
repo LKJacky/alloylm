@@ -212,8 +212,10 @@ async def run_eval(config: EvalConfig):
     datasets = await asyncio.gather(*[asyncio.create_task(x.build()) for x in config.datasets])
 
     for dataset in datasets:
-        dataset.config.infer_args.model_url = config.url
-        dataset.config.infer_args.model_name = config.model_name
+        if config.url is not None:
+            dataset.config.infer_args.model_url = config.url
+        if config.model_name is not None:
+            dataset.config.infer_args.model_name = config.model_name
         print(f"build {dataset.config.name}, total {len(dataset)} samples")
 
     if config.one_by_one:
