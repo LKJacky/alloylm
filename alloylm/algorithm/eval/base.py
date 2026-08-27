@@ -5,6 +5,7 @@ import shutil
 import time
 import traceback
 
+import aiofiles
 import pandas as pd
 import tqdm
 from pydantic import BaseModel
@@ -69,7 +70,7 @@ class EvalRunner:
             else:
                 task_data = task_item.task_data
             return task_data
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Error in run_eval for task {task_item.task_data.id}:", e, traceback.format_exc())
             return None
 
@@ -109,7 +110,7 @@ class EvalRunner:
                         running_futures.add(future)
                         future_to_dataset[future] = dataset.config.name
                         submitted += 1
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print("Error in produce:", e, traceback.format_exc())
 
         async def get_done_future():
@@ -117,7 +118,7 @@ class EvalRunner:
                 if len(running_futures) > 0:
                     done, _ = await asyncio.wait(running_futures, return_when=asyncio.FIRST_COMPLETED, timeout=1.0)
                     if len(done) > 0:
-                        future = list(done)[0]
+                        future = next(iter(done))
                         running_futures.remove(future)
                         return future
                 await asyncio.sleep(0.1)
@@ -158,7 +159,7 @@ class EvalRunner:
                 summary = dataset.summary(valid)
                 results.append(summary)
                 print(f"Dataset {name} eval done, main metric: {summary.metric:.4f}")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print("Error in EvalRunner:", e, traceback.format_exc())
             results = []
         finally:
@@ -174,14 +175,15 @@ class EvalRunner:
         if self.work_dir:
             result_dict = {r.dataset_name: r for r in results}
             summary_path = os.path.join(self.work_dir, "result.json")
+
             if os.path.exists(summary_path):
-                with open(summary_path, encoding="utf-8") as f:
-                    old_results = json.load(f)
+                async with aiofiles.open(summary_path, encoding="utf-8") as f:
+                    old_results = json.loads(await f.read())
             else:
                 old_results = {}
             old_results.update({k: v.model_dump(exclude="task_data") for k, v in result_dict.items()})
-            with open(summary_path, "w", encoding="utf-8") as f:
-                json.dump(old_results, f, ensure_ascii=False, indent=4)
+            async with aiofiles.open(summary_path, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(old_results, ensure_ascii=False, indent=4))
 
         if len(results) > 0:
             df = pd.DataFrame(columns=list(results[0].model_dump(exclude="task_data").keys()))
@@ -216,6 +218,8 @@ async def run_eval(config: EvalConfig):
             dataset.config.infer_args.model_url = config.url
         if config.model_name is not None:
             dataset.config.infer_args.model_name = config.model_name
+        if config.concurrency is not None:
+            dataset.config.infer_args.concurrency = config.concurrency
         print(f"build {dataset.config.name}, total {len(dataset)} samples")
 
     if config.one_by_one:

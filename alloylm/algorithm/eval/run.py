@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import importlib
-import os
 
 from alloylm.algorithm.eval.base import EvalConfig, run_eval
 
@@ -15,7 +14,7 @@ async def main():
     parser.add_argument("--one-by-one", action="store_true")
     parser.add_argument("--mode", type=str, default="all")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--concurrency", type=int, default=os.environ.get("MAX_CONCURRENCY", 1024))
+    parser.add_argument("--concurrency", type=int, default=None)
     args = parser.parse_args()
 
     config_module = importlib.import_module(args.config.replace(".py", "").replace("/", "."))
