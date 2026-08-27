@@ -25,7 +25,8 @@ async def main():
     config.one_by_one = args.one_by_one
     config.mode = args.mode
     config.resume = args.resume
-    config.concurrency = args.concurrency
+    if args.concurrency is not None:
+        config.concurrency = args.concurrency
 
     print(f"Loaded config: {config}")
 
