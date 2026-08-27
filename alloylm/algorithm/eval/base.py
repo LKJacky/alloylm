@@ -24,31 +24,28 @@ def load_jsonl(path: str) -> list[dict]:
 
 
 async def save_to_file(queue: asyncio.Queue, file_path: str):
-    def append_once(data, file_path):
-        if len(data) > 0:
-            with open(file_path, "a", encoding="utf-8") as f:
-                f.writelines(json.dumps(d.model_dump(), ensure_ascii=False) + "\n" for d in data)
-
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     if os.path.exists(file_path):
         shutil.copy(file_path, file_path + ".bak")
     cached = []
-    try:
-        while True:
-            item = await queue.get()
-            cached.append(item)
-            if len(cached) < 100:
-                continue
-            await asyncio.to_thread(append_once, cached, file_path)
-            cached.clear()
-    finally:
-        while not queue.empty():
-            item = queue.get_nowait()
-            cached.append(item)
-        if len(cached) > 0:
-            await asyncio.to_thread(append_once, cached, file_path)
-        if os.path.exists(file_path + ".bak"):
-            os.remove(file_path + ".bak")
+    last_save_time = time.time()
+    async with aiofiles.open(file_path, "a", encoding="utf-8") as f:
+        try:
+            while True:
+                item = await queue.get()
+                cached.append(item)
+                if time.time() - last_save_time > 60:
+                    await f.write(json.dumps(item.model_dump(), ensure_ascii=False) + "\n")
+                    cached.clear()
+                    last_save_time = time.time()
+        finally:
+            while not queue.empty():
+                item = queue.get_nowait()
+                cached.append(item)
+            if len(cached) > 0:
+                await f.writelines(json.dumps(d.model_dump(), ensure_ascii=False) + "\n" for d in cached)
+            if os.path.exists(file_path + ".bak"):
+                os.remove(file_path + ".bak")
 
 
 class EvalRunner:
