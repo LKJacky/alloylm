@@ -35,7 +35,7 @@ async def save_to_file(queue: asyncio.Queue, file_path: str):
                 item = await queue.get()
                 cached.append(item)
                 if time.time() - last_save_time > 60:
-                    await f.write(json.dumps(item.model_dump(), ensure_ascii=False) + "\n")
+                    await f.writelines(json.dumps(d.model_dump(), ensure_ascii=False) + "\n" for d in cached)
                     cached.clear()
                     last_save_time = time.time()
         finally:
