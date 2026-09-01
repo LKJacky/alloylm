@@ -1,78 +1,49 @@
-# syntax=docker/dockerfile:1.7
-
 FROM pytorch/pytorch:2.12.0-cuda13.0-cudnn9-devel
 
-ENV DEBIAN_FRONTEND=noninteractive
+ARG DEBIAN_FRONTEND=noninteractive
 
-# Install development tools
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y \
-    bash  curl git tar unzip zip \
-    sudo procps rsync tree vim tmux
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Update and install essential dev packages
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked  \
-    apt-get update && apt-get install -y \
-    # Shell & basic utils
+# Install development tools.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
     bash \
-    curl \
-    wget \
-    git \
-    vim \
-    nano \
-    htop \
-    tree \
-    unzip \
-    zip \
-    tar \
-    # Build tools
     build-essential \
     cmake \
-    make \
-    gcc \
+    curl \
     g++ \
-    # Python
-    python3-venv \
-    # Process & system
+    gcc \
+    git \
+    htop \
     lsof \
+    make \
+    nano \
+    pre-commit \
     procps \
+    python3-venv \
     rsync \
-    tmux \
     shfmt \
-    pre-commit
+    sudo \
+    tar \
+    tmux \
+    tree \
+    unzip \
+    vim \
+    wget \
+    zip \
+    && rm -rf /var/lib/apt/lists/*
 
-# create python environment
-RUN python3 -m venv --system-site-packages /workspaces/.venv
+# Create the Python environment.
+RUN python3 -m venv --system-site-packages /workspaces/.venv \
+    && /workspaces/.venv/bin/python -m pip install --no-cache-dir --upgrade pip
 
-# build flash-attn
-ARG FLASH_ATTN_CUDA_ARCHS
-RUN if [ -n "${FLASH_ATTN_CUDA_ARCHS}" ]; then \
-        export FLASH_ATTN_CUDA_ARCHS; \
-        echo "Building flash-attn for CUDA architectures: ${FLASH_ATTN_CUDA_ARCHS}"; \
-    else \
-        echo "FLASH_ATTN_CUDA_ARCHS is not set. Using default architectures."; \
-        unset FLASH_ATTN_CUDA_ARCHS; \
-    fi \
-    && NVCC_THREADS=4 MAX_JOBS=4 /workspaces/.venv/bin/pip install flash-attn --no-build-isolation
-
-# Install Node.js and AI tools
+# Install Node.js and AI tools.
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && npm install -g @github/copilot @anthropic-ai/claude-code @openai/codex
-RUN /workspaces/.venv/bin/pip install "hermes-node @ git+https://github.com/LKJacky/hermes_nodes.git#subdirectory=node"
-
-# Install Python dependencies
-# RUN pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install --global @github/copilot @anthropic-ai/claude-code @openai/codex \
+    && rm -rf /var/lib/apt/lists/*
+RUN /workspaces/.venv/bin/pip install --no-cache-dir \
+    "hermes-node @ git+https://github.com/LKJacky/hermes_nodes.git#subdirectory=node"
+# Install Python dependencies.
 COPY requirements.txt /root/requirements.txt
-RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    /workspaces/.venv/bin/pip install -r /root/requirements.txt
-
-
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked  \
-    apt-get update && apt-get install -y gnome-keyring libsecret-1-0 dbus-x11
-
-# Clean up
-RUN apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN /workspaces/.venv/bin/pip install --no-cache-dir -r /root/requirements.txt

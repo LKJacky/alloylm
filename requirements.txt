@@ -8,6 +8,7 @@ datasets>=2.14.0
 
 # --- Inference Server ---
 fastapi>=0.100.0
+flash-attn-4==4.0.0b28
 flashinfer-python>=0.2.0
 httpx>=0.25.0
 huggingface_hub>=0.20.0
@@ -40,11 +41,3 @@ tqdm>=4.65.0
 transformers>=4.51.0,<6
 typing_extensions>=4.0.0
 uvicorn[standard]>=0.23.0
-
-# ============================================================
-# GPU-specific packages (install separately with matching CUDA/torch version)
-# ============================================================
-#
-# flash-attn (requires torch + CUDA, build from source or use pre-built wheels):
-#   pip install flash-attn --no-build-isolation
-#   or: pip install flash-attn==2.7.4.post1 --no-build-isolation

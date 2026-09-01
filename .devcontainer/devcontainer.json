@@ -2,10 +2,7 @@
   "name": "llm_research",
   "build": {
     "dockerfile": "Dockerfile",
-    "context": "..",
-    "args": {
-      // "FLASH_ATTN_CUDA_ARCHS": "120" // Set the CUDA architectures for flash-attention build
-    }
+    "context": ".."
   },
   "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
   "mounts": [

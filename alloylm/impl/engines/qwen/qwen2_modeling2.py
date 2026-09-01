@@ -341,8 +341,8 @@ class Qwen2Attention(nn.Module):
         ):
             sliding_window = self.config.sliding_window
 
-        self.config._attn_implementation = "flash_attention_2"
-        attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
+        self.config._attn_implementation = "flash_attention_4"
+        attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_4"]
 
         if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
             sp_size = sequence_parallel_mesh.size()
@@ -361,9 +361,6 @@ class Qwen2Attention(nn.Module):
             value_states = all_to_all(
                 value_states, scatter_dim=1, gather_dim=2, mesh=sequence_parallel_mesh, training=self.training
             )
-
-        if "flash_attention2" in self.config._attn_implementation:
-            kwargs["deterministic"] = True
 
         # (bs, n , qh // sp, d)
         attn_output, attn_weights = attention_interface(
