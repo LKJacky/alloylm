@@ -24,7 +24,16 @@ class TestTask(CudaAsyncTestCase):
 
     async def test_eval_runner(self):
         async with self.__class__.engine:
-            dataset = await GSM8KDatasetConfig(task_cls=GSM8KTask, infer_args=InferArgs(model_name="ALLOYLM")).build()
+            dataset = await GSM8KDatasetConfig(
+                task_cls=GSM8KTask,
+                infer_args=InferArgs(
+                    model_name="ALLOYLM",
+                    sample_args={
+                        "temperature": 0.0,
+                        "extra_body": {"top_k": 1},
+                    },
+                ),
+            ).build()
             dataset.data = [dataset.data[i] for i in range(32)]
             runner = EvalRunner(dataset, work_dir="work_dirs/tests/test_eval/")
             summary = await runner.run(asyncio.Semaphore(512))
@@ -130,7 +139,7 @@ class TestSglangTask(CudaAsyncTestCase):
 
                     terminate_process(self.process)
                     self.process = None
-            except Exception:
+            except Exception:  # noqa
                 pass
 
     @unittest.skipUnless(os.environ.get("ENABLE_LONG_RUNNING_TESTS", "0") == "1", "Skipping long-runing test")
