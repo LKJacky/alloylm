@@ -1,8 +1,10 @@
 import gc
+import math
 import os
 import sys
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from concurrent.futures import wait
 from contextlib import contextmanager
 from datetime import timedelta
@@ -37,7 +39,14 @@ from alloylm.engine.train_engine.utils import (
     get_logger,
 )
 
-from .dataset import SoftPackDataset, TaskDataset, task_collate_fn
+from .dataset import (
+    SFTData,
+    SFTDataset,
+    SoftPackDataset,
+    TaskDataset,
+    sft_collate_fn,
+    task_collate_fn,
+)
 from .utils import clip_grad_norm_, profile_time_and_memory
 
 logger = get_logger()
@@ -181,7 +190,7 @@ class TrainState(Stateful):
         super().__init__()
 
         self.seed = seed
-        self.cur_step = -1
+        self.cur_step = 0
         self.total_steps = total_steps
         self.if_nan_skip_steps = 0
         self.num_optimize = 0
@@ -212,11 +221,16 @@ class TrainState(Stateful):
 
 
 class TrainEngineConfig(BaseModel):
-    max_length: int = 1024
+    max_length: int = 1024  # max length for training
 
     # Optimization Related Settings
     lr: float = 1e-6
     wd: float = 0.1
+
+    # for scheduler
+    scheduler_type: str = "constant"  # "constant" or "cosine"
+    warmup_ratio: float = 0.0
+    lr_min: float = 0.0
 
     # General Settings
     work_dir: str = "work_dirs"
@@ -304,20 +318,38 @@ class TrainEngine:
         )  # TODO: check whether some parameters do not need weight decay, e.g., bias.
 
         # warm up setup
-        # self.warmup_steps = int(self.config.warmup_ratio * self.total_steps)
+        self.warmup_steps = int(self.config.warmup_ratio * self.total_steps)
         # self.cosine_scheduler = CosineAnnealingWithWarmup(
         #     self.optimizer, min_lr=self.args.lr_min, warmup_steps=self.warmup_steps, total_steps=self.total_steps
         # )
-        self.cosine_scheduler = ConstantLR(
-            optimizer=self.optimizer, factor=1
-        )  # TODO: support both cosine scheduler and constant scheduler
+
+        def cos_lr_lambda(
+            step,
+            lr=self.config.lr,
+            lr_min=self.config.lr_min,
+            warm_up_steps=self.warmup_steps,
+            total_steps=self.total_steps,
+        ):
+            """Warmup + cosine-decay learning-rate schedule (used by SFT)."""
+            if step < warm_up_steps:
+                return step / max(1, warm_up_steps)
+            progress = (step - warm_up_steps) / max(1, total_steps - warm_up_steps)
+            min_ratio = lr_min / lr if lr > 0 else 0.0
+            return min_ratio + (1 - min_ratio) * (1 + math.cos(math.pi * progress)) / 2
+
+        if self.config.scheduler_type == "cosine":
+            self.cosine_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, cos_lr_lambda)
+        else:
+            self.cosine_scheduler = ConstantLR(
+                optimizer=self.optimizer, factor=1
+            )  # TODO: support both cosine scheduler and constant scheduler
 
     def lazy_init(self):
         pass
 
     # training step
 
-    def step(self, batch: list[dict[str, Any]], step):
+    def step(self, batch: list[dict[str, Any]], step):  # step rl
         dataset = TaskDataset(batch)
         pack_dataset = SoftPackDataset([dataset], target=self.config.max_length)
         dataloader = DataLoader(
@@ -344,6 +376,106 @@ class TrainEngine:
         self.train_rl_step(batch, step, dataloader, batch_info)
 
         return batch_info
+
+    def set_sft_data(
+        self,
+        batch: list[SFTData],
+        jsonl_sources: list,
+        chat_template: Callable,
+    ):
+        """SFT training step: pack tokenized samples and run cross-entropy training."""
+
+        # build dataset
+        dataset = SFTDataset(batch, jsonl_paths=jsonl_sources, tokenizer=self.tokenizer, chat_template=chat_template)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=1,
+            num_workers=0,
+            collate_fn=sft_collate_fn,
+            persistent_workers=False,
+            sampler=DistributedSampler(
+                dataset,
+                num_replicas=self.dp_size,
+                rank=self.dp_mesh.get_local_rank(),
+                shuffle=False,
+                drop_last=False,
+            ),
+        )
+        dataloader.sampler.set_epoch(0)
+        self.sft_data_iter = iter(dataloader)
+
+    def step_sft(self, num_micro_steps: int) -> dict[str, float]:
+        """Train one SFT step: standard causal-LM cross-entropy on (input_ids, labels).
+
+        Samples are packed by SoftPackDataset into `max_length` sequences; each packed
+        sequence is a forward+backward (gradient accumulation), then a single optimizer
+        step with gradient clipping.
+        """
+        self.patched_llm.train()
+        micro_batch = []
+        for i in range(num_micro_steps):
+            micro_batch.append(next(self.sft_data_iter))
+
+        # total number of supervised tokens in this step (reduced across dp ranks)
+        total_tokens = torch.tensor(0.0, device="cuda")
+        for packed_batch in micro_batch:
+            total_tokens += (packed_batch["labels"] != -100).sum().float().cuda()
+        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+        total_tokens = total_tokens.item()
+        if total_tokens == 0:
+            get_logger().warning("No supervised tokens in this step, skipping.")
+            return {"loss": 0.0, "grad_norm": 0.0, "num_tokens": 0}
+
+        step_t0 = time.time()
+        step_loss = 0.0
+        for packed_batch in micro_batch:
+            input_ids = packed_batch["input_ids"].cuda()
+            labels = packed_batch["labels"].cuda()
+            seq_lens = packed_batch["seq_lens"].cuda()
+            position_ids = torch.cat([torch.arange(n) for n in seq_lens.tolist()], dim=0).cuda().unsqueeze_(0)
+
+            logits = self.patched_llm.train_forward(
+                TrainInput(input_ids=input_ids, position_ids=position_ids, seq_lens=seq_lens.int())
+            )  # [1, seq, vocab]
+
+            shift_logits = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
+            shift_labels = labels[:, 1:].contiguous().view(-1)
+            n_valid = (shift_labels >= 0).sum()
+            if n_valid == 0:
+                continue
+            loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+            # normalize so the optimizer step averages over all supervised tokens
+            loss = loss * (n_valid / total_tokens * self.dp_size)
+            loss.backward()
+            step_loss += loss.item()
+
+        grad_norm = clip_grad_norm_([param for param in self.patched_llm.parameters() if param.requires_grad], 1.0)
+        if grad_norm.isnan() or grad_norm.isinf():
+            get_logger().warning(
+                f"[SFT Step {self.train_state.cur_step}] grad norm is NaN/Inf, skipping optimizer step."
+            )
+        else:
+            self.optimizer.step()
+        self.optimizer.zero_grad()
+        self.cosine_scheduler.step()
+
+        # reduce loss across dp ranks for logging
+        reduced_loss = torch.tensor(step_loss, device="cuda")
+        dist.all_reduce(reduced_loss, op=dist.ReduceOp.AVG)
+        step_time = time.time() - step_t0
+
+        get_logger().info(
+            f"[SFT] Step {self.train_state.cur_step}/{self.total_steps}  "
+            f"loss: {reduced_loss.item():.4f}  "
+            f"grad_norm: {grad_norm:.2f}  "
+            f"lr: {self.cosine_scheduler.get_last_lr()[0]:.6f}  "
+            f"tokens: {int(total_tokens)}  "
+            f"time: {step_time:.2f}s  "
+            f"Mem: {torch.cuda.max_memory_allocated() / 1024**3:.1f} G"
+        )
+
+        self.train_state.step()
+        return {"loss": reduced_loss.item(), "grad_norm": grad_norm.item(), "num_tokens": int(total_tokens)}
 
     @torch.no_grad()
     def _log_logprob_diff(self, tasks: list[dict[str, Any]]):

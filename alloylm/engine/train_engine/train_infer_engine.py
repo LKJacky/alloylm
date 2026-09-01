@@ -2,6 +2,7 @@ import asyncio
 import gc
 import os
 import uuid
+from collections.abc import Callable
 
 import aiofiles
 import httpx
@@ -15,6 +16,7 @@ from transformers import AutoTokenizer
 from alloylm.engine.infer_engine.engine import InferEngine, InferEngineConfig
 from alloylm.engine.model import AlloyLMModelConfig
 from alloylm.engine.spmd import SPMDActor, SPMDActorConfig
+from alloylm.engine.train_engine.dataset import SFTData
 from alloylm.engine.train_engine.utils import (
     get_logger,
 )
@@ -95,6 +97,18 @@ class TrainInferEngine:
 
     def checkpoint(self, folder):
         return self.train_engine.checkpoint(folder)
+
+    # sft
+    def set_sft_data(
+        self,
+        batch: list[SFTData],
+        jsonl_sources: list,
+        chat_template: Callable,
+    ):
+        self.train_engine.set_sft_data(batch, jsonl_sources, chat_template)
+
+    def step_sft(self, num_micro_steps: int) -> dict[str, float]:
+        return self.train_engine.step_sft(num_micro_steps)
 
 
 # spmd
@@ -207,3 +221,17 @@ class SpmdTrainInferEngine:
             self.actor.shutdown()
             del self.actor
         gc.collect()
+
+    async def set_sft_data(
+        self,
+        batch: list[SFTData],
+        jsonl_sources: list,
+        chat_template: Callable,
+    ):
+        await self.actor.set_sft_data(batch, jsonl_sources, chat_template)
+
+    async def step_sft(self, num_micro_steps: int) -> dict[str, float]:
+        # The SPMD actor returns one result per worker rank; return rank 0's,
+        # mirroring self.train() above (all ranks share the globally-reduced loss).
+        results = await self.actor.step_sft(num_micro_steps)
+        return results[0]
