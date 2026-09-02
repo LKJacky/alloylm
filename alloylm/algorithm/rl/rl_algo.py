@@ -578,9 +578,9 @@ class RLAlgorithm:
 
     def prepare_fake_data(self):
         train_batch = []
-        seq_len = 1024
-        prompt_len = 200
         for _ in range(self.args.roll_out_bs * self.args.num_rl_group):
+            seq_len = random.randint(512, 1024)
+            prompt_len = random.randint(100, seq_len // 2)
             input_ids = [random.randint(0, 1000) for _ in range(seq_len)]
             labels = [-100] * prompt_len + input_ids[prompt_len:]
             log_probs = [random.uniform(-5.0, -0.1) for _ in range(seq_len)]

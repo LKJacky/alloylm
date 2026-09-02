@@ -83,8 +83,7 @@ def create_trainer(
             infer_config=InferEngineConfig(
                 model_name=DEFAULT_MODEL_NAME,
                 max_prefill_length=config.max_prefill_length,
-                rollout_max_batch_size=config.max_concurrency_per_node,
-                cache_max_entry_count=config.cache_max_entry_count,
+                memory_usage=config.cache_max_entry_count,
             ),
         ),
         datasets=config.train_datasets,
