@@ -1,5 +1,3 @@
-import asyncio
-import gc
 import json
 import os
 import random
@@ -7,7 +5,6 @@ import shutil
 from typing import Any
 
 import aiofiles
-import torch
 from pydantic import BaseModel
 from transformers import AutoTokenizer
 
@@ -98,7 +95,6 @@ class SFTTrainer:
 
     def __init__(self, config: SFTAlgorithmConfig):
         self.config = config
-        self.model_engine = SpmdTrainInferEngine(model_config=config.llm_config, engine_config=config.engine_config)
 
         # Data path: a tokenizer + chat template shared by packing (driver) and
         # the engine's SFTDataset (workers), so num_tokens agree on both sides.
@@ -110,7 +106,7 @@ class SFTTrainer:
             trust_remote_code=True,
         )
         self.chat_template = ChatTemplate(self.tokenizer)
-        self.dp_size = config.llm_config.fsdp_config.train_mesh["dp"].size()
+        self.dp_size = config.llm_config.fsdp_config.train_mesh["mesh_shape"][0]
 
         # Populated by lazy_init / advanced by fit.
         self.jsonl_paths: list[str] = []
@@ -125,14 +121,22 @@ class SFTTrainer:
         self.tb_writer = get_tb_writer()
 
         self.logger.info(str(self.config.model_dump()))
-        self.logger.info(str(self.model_engine.config.model_dump()))
 
     async def lazy_init(self):
-        # Build the datasets while the engine spins up -- both are slow and
-        # independent, so run them concurrently.
-        await asyncio.gather(self.model_engine.lazy_init(), self._build_data())
-        if self.config.auto_resume:
-            await self.resume()
+        with MeasureTime("lazy_init") as timer:
+            with MeasureTime("build data"):
+                await self._build_data()  # need build_data to compute total_training_steps
+                self.config.engine_config.train_config.total_training_steps = self.config.total_training_steps
+            with MeasureTime("init model engine"):
+                self.model_engine = SpmdTrainInferEngine(
+                    model_config=self.config.llm_config, engine_config=self.config.engine_config
+                )
+                await self.model_engine.lazy_init()
+            with MeasureTime("resume"):
+                if self.config.auto_resume:
+                    await self.resume()
+        for line in timer.format_summary().splitlines():
+            self.logger.info(f"{line}")
 
     async def _build_data(self):
         # Build every dataset and merge their packs into one global list. Each
@@ -185,7 +189,7 @@ class SFTTrainer:
     async def fit(self):
         epoch = -1
         for step in range(self.cur_step, self.config.total_training_steps):
-            with MeasureTime("step"):
+            with MeasureTime("step_time") as timer:
                 self.cur_step = step
 
                 # (Re)feed the engine at each epoch boundary. Feeding once per
@@ -196,37 +200,30 @@ class SFTTrainer:
                 if cur_epoch != epoch:
                     epoch = cur_epoch
                     self.logger.info(f"*Loading SFT data for epoch {epoch} (step {step})")
-                    with MeasureTime("set_data"):
-                        await self.model_engine.set_sft_data(
-                            self.epoch_packs(epoch),
-                            self.jsonl_paths,
-                            self.chat_template,
-                        )
 
-                with MeasureTime("train"):
+                    await self.model_engine.set_sft_data(
+                        self.epoch_packs(epoch),
+                        self.jsonl_paths,
+                        self.chat_template,
+                    )
+
+                with MeasureTime("train_time"):
                     train_log = await self.model_engine.step_sft(self.config.micro_batch_size)
 
-                log_str = ", ".join(f"{k}: {v:.4f}" for k, v in train_log.items())
-                self.logger.info(f"*SFT step {step} (epoch {epoch}) logs: {log_str}")
-                for k, v in train_log.items():
-                    self.tb_writer.add_scalar(f"sft/{k}", v, step)
-                self.tb_writer.add_scalar("sft/epoch", epoch, step)
-
-                gc.collect()
-                torch.cuda.empty_cache()
+                # gc.collect()
+                # torch.cuda.empty_cache()
 
                 if (step + 1) % self.config.checkpoint_interval == 0:
-                    with MeasureTime("ckpt"):
+                    with MeasureTime("ckpt_time"):
                         await self.checkpoint(step)
 
-            MeasureTime.saved_time["others"] = 2 * MeasureTime.saved_time["step"] - sum(
-                list(MeasureTime.saved_time.values())
-            )
-            for key in MeasureTime.saved_time:
-                self.logger.info(f"Time for {key}: {int(MeasureTime.saved_time[key])} seconds")
-                self.tb_writer.add_scalar(f"Time/{key}", int(MeasureTime.saved_time[key]), step)
-            MeasureTime.clear()
-            self.logger.info("----------------------------\n\n")
+            # log
+            for k, v in train_log.items():
+                self.tb_writer.add_scalar(f"sft/{k}", v, step)
+            self.tb_writer.add_scalar("sft/epoch", epoch, step)
+
+            for key, t in timer.summary().items():
+                self.tb_writer.add_scalar(f"Time/{key}", t, step)
 
     async def checkpoint(self, step):
         ckpt_folder = self.config.work_dir + "/checkpoints/"

@@ -783,7 +783,7 @@ class RLTrainer:
 
     async def fit(self):
         for step in range(self.cur_step, self.config.total_training_steps):
-            with MeasureTime("step"):
+            with MeasureTime("step") as timer:
                 self.cur_step = step
                 self.logger.info(f"*Starting training step {step}")
 
@@ -830,13 +830,11 @@ class RLTrainer:
                             f"New best reward {eval_reward:.4f} at step {step}, checkpoint saved to best_ckpt/"
                         )
                         self.best_reward = eval_reward
-            MeasureTime.saved_time["others"] = 2 * MeasureTime.saved_time["step"] - sum(
-                list(MeasureTime.saved_time.values())
-            )
-            for key in MeasureTime.saved_time:
-                self.logger.info(f"Time for {key}: {int(MeasureTime.saved_time[key])} seconds")
-                self.tb_writer.add_scalar(f"Time/{key}", int(MeasureTime.saved_time[key]), step)
-            MeasureTime.clear()
+
+            for line in timer.format_summary().split("\n"):
+                self.logger.info(line)
+            for key, t in timer.get_summary().items():
+                self.tb_writer.add_scalar(f"Time/{key}", t, step)
             self.logger.info("----------------------------\n\n")
 
     async def checkpoint(self, step):

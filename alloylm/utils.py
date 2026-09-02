@@ -35,10 +35,10 @@ def log_format(rank, debug=False):
     formatter = f"[AlloyLM][RANK {rank}]"
     formatter += "[{time:YYYY-MM-DD HH:mm:ss}][<level>{level}</level>]"
 
-    if debug:
-        formatter += "[<cyan>{name}</cyan>:"
-        formatter += "<cyan>{function}</cyan>:"
-        formatter += "<cyan>{line}</cyan>]"
+    # if debug:
+    #     formatter += "[<cyan>{name}</cyan>:"
+    #     formatter += "<cyan>{function}</cyan>:"
+    #     formatter += "<cyan>{line}</cyan>]"
 
     formatter += " <level>{message}</level>"
     return formatter
@@ -86,7 +86,7 @@ def load_jsonl(file_path):
 # for server
 
 
-def get_free_port(forbid_port=[]):
+def get_free_port(forbid_port=()):
     """Let the OS choose an available port, avoiding forbidden ports."""
     while True:
         try:
