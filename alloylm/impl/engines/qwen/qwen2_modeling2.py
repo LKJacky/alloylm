@@ -678,10 +678,17 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
     ):
         _input_ids = input_ids
         _position_ids = position_ids
-        _cu_seq_lens_q = cu_seq_lens_q
-        _cu_seq_lens_k = cu_seq_lens_k
-        _max_length_q = max_length_q
-        _max_length_k = max_length_k
+        if cu_seq_lens_q is None:
+            cu_seq_lens_q = torch.arange(
+                input_ids.size(0) + 1,
+                dtype=torch.int32,
+                device=input_ids.device,
+            ) * input_ids.size(1)
+            cu_seq_lens_k = cu_seq_lens_q
+            max_length_q = input_ids.size(1)
+            max_length_k = max_length_q
+        else:
+            assert all(x is not None for x in [cu_seq_lens_k, max_length_q, max_length_k])
 
         if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
             multiple_of = sequence_parallel_mesh.size() * 1
@@ -699,20 +706,17 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
 
         if self.training and num_padded_tokens > 0:
             assert torch.any(cu_seq_lens_k == cu_seq_lens_q)
-            _cu_seq_lens_q = _cu_seq_lens_q.tolist()
-            _cu_seq_lens_q.append(_cu_seq_lens_q[-1] + num_padded_tokens)
+            cu_seq_lens_q = torch.cat((cu_seq_lens_q, cu_seq_lens_q[-1:] + num_padded_tokens))
+            cu_seq_lens_k = cu_seq_lens_q
 
-            _cu_seq_lens_q = torch.IntTensor(_cu_seq_lens_q).to(cu_seq_lens_q.device)
-            _cu_seq_lens_k = _cu_seq_lens_q
-
-            _max_length_q = max(_max_length_q, num_padded_tokens)
-            _max_length_k = _max_length_q
+            max_length_q = max(max_length_q, num_padded_tokens)
+            max_length_k = max_length_q
 
         return (_input_ids, _position_ids), {
-            "cu_seq_lens_q": _cu_seq_lens_q,
-            "cu_seq_lens_k": _cu_seq_lens_k,
-            "max_length_q": _max_length_q,
-            "max_length_k": _max_length_k,
+            "cu_seq_lens_q": cu_seq_lens_q,
+            "cu_seq_lens_k": cu_seq_lens_k,
+            "max_length_q": max_length_q,
+            "max_length_k": max_length_k,
             "sequence_parallel_mesh": self.fsdp_config.train_mesh["sp"],
         }
 
