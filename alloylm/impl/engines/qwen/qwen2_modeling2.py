@@ -8,6 +8,7 @@ from typing import Optional, Unpack
 import flashinfer
 import torch
 from accelerate.utils import set_module_tensor_to_device
+from flash_attn.cute import flash_attn_varlen_func
 from torch import distributed as dist
 from torch import nn
 from torch.distributed._composable.fsdp import (
@@ -41,7 +42,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3 import Qwen3Config
 from transformers.models.qwen3_moe import Qwen3MoeConfig
@@ -260,6 +261,11 @@ class Qwen2Attention(nn.Module):
         query_states, key_states, value_states, input_shape = self.qkv_proj(hidden_states, position_embeddings)
         attention_args = kwargs.get("attention_args", None)
         if attention_args:
+            query_states, key_states, value_states = (
+                query_states.transpose(1, 2),
+                key_states.transpose(1, 2),
+                value_states.transpose(1, 2),
+            )
             prefilling = kwargs.get("prefilling", False)
             infer_args = [query_states, key_states, value_states, attention_args]
             if prefilling:
@@ -267,7 +273,7 @@ class Qwen2Attention(nn.Module):
             else:
                 attn_output = self.forward_decoding(*infer_args)[0]
         else:
-            attn_output = self.forward_training(query_states, key_states, value_states, None, **kwargs)[0]
+            attn_output = self.forward_training(query_states, key_states, value_states, **kwargs)[0]
         attn_output = attn_output.reshape(*input_shape, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output, None
@@ -281,15 +287,15 @@ class Qwen2Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         if self.qk_norm:
-            query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
+            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
         else:
-            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-            key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            query_states = self.q_proj(hidden_states).view(hidden_shape)
+            key_states = self.k_proj(hidden_states).view(hidden_shape)
+        value_states = self.v_proj(hidden_states).view(hidden_shape)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, unsqueeze_dim=2)
         return query_states, key_states, value_states, input_shape
 
     @torch.compiler.disable
@@ -324,27 +330,27 @@ class Qwen2Attention(nn.Module):
     @torch.compiler.disable
     def forward_training(
         self: "Qwen2Attention",
-        query_states,
-        key_states,
-        value_states,
-        attention_mask: torch.Tensor | None,
-        past_key_value=None,
-        cache_position: torch.LongTensor | None = None,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cu_seq_lens_q: torch.Tensor,
+        cu_seq_lens_k: torch.Tensor,
+        max_length_q: int,
+        max_length_k: int,
         sequence_parallel_mesh: DeviceMesh | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
-        sliding_window = None
         if (
             self.config.use_sliding_window
             and getattr(self.config, "sliding_window", None) is not None
             and self.layer_idx >= self.config.max_window_layers
         ):
-            sliding_window = self.config.sliding_window
-
-        self.config._attn_implementation = "flash_attention_4"
-        attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_4"]
+            window_size = (self.config.sliding_window - 1, self.config.sliding_window - 1)
+        else:
+            window_size = (None, None)
 
         if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
+            raise NotImplementedError("Sequence parallelism is not supported in training mode yet.")
             sp_size = sequence_parallel_mesh.size()
             num_kv_heads = key_states.size(1)
             if sp_size > num_kv_heads:
@@ -363,24 +369,24 @@ class Qwen2Attention(nn.Module):
             )
 
         # (bs, n , qh // sp, d)
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=sliding_window,
-            **kwargs,
+        attn_output, _ = flash_attn_varlen_func(
+            query_states.flatten(0, 1),
+            key_states.flatten(0, 1),
+            value_states.flatten(0, 1),
+            cu_seqlens_q=cu_seq_lens_q,
+            cu_seqlens_k=cu_seq_lens_k,
+            max_seqlen_q=max_length_q,
+            max_seqlen_k=max_length_k,
+            softmax_scale=self.scaling,
+            causal=True,
+            window_size=window_size,
         )
-
         if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
             attn_output = all_to_all(
                 attn_output, scatter_dim=1, gather_dim=2, mesh=sequence_parallel_mesh, training=self.training
             )
 
-        return attn_output, attn_weights
+        return attn_output, None
 
     @torch.compiler.disable
     def forward_prefill(
