@@ -1,4 +1,3 @@
-import asyncio
 import gc
 import json
 import math
@@ -7,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 
+import aiofiles
 import torch
 from torch import distributed as dist
 from transformers import AutoTokenizer
@@ -21,6 +21,7 @@ from alloylm.engine.train_engine.train_engine import TrainEngine, TrainEngineCon
 from alloylm.engine.train_engine.train_infer_engine import TrainInferEngineConfig
 from alloylm.engine.train_engine.utils import FSDPConfig
 from alloylm.impl.engines.qwen.qwen2_modeling2 import FSDPQwen2ForCausalLM
+from alloylm.test_utils import CudaAsyncTestCase
 
 MODEL_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
 NUM_SFT_STEPS = 12
@@ -247,7 +248,7 @@ class SFTTrainEndToEndTest(unittest.TestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-class SFTTrainerEndToEndTest(unittest.TestCase):
+class SFTTrainerEndToEndTest(CudaAsyncTestCase):
     """End-to-end SFT through the full orchestration stack -- ``SFTTrainer`` +
     ``SpmdTrainInferEngine`` -- driven exactly as ``alloylm/algorithm/sft/run.py``
     does (``lazy_init`` then ``fit``).
@@ -312,8 +313,9 @@ class SFTTrainerEndToEndTest(unittest.TestCase):
         )
         return SFTTrainer(config)
 
-    def test_trains_and_checkpoints(self):
+    async def test_trains_and_checkpoints(self):
         trainer = self._make_trainer()
+        await trainer.lazy_init()
 
         # Capture each step's log. Wrapping the SPMD engine's step_sft here also
         # guards its list->dict unwrapping (return results[0]), which the raw
@@ -328,12 +330,8 @@ class SFTTrainerEndToEndTest(unittest.TestCase):
 
         trainer.model_engine.step_sft = recording_step_sft
 
-        async def run(t):
-            await t.lazy_init()
-            await t.fit()
-
         try:
-            asyncio.run(run(trainer))
+            await trainer.fit()
 
             # 3 conversations pack into 2 packs at max_length=1024, dp_size=1.
             self.assertEqual(trainer.steps_per_epoch, 2)
@@ -350,8 +348,9 @@ class SFTTrainerEndToEndTest(unittest.TestCase):
             self.assertEqual(sorted(os.listdir(ckpt_root)), ["000001", "000003"])
             # algo.json records the NEXT step to run, so a resume continues past it.
             for folder, expected_next in (("000001", 2), ("000003", 4)):
-                with open(os.path.join(ckpt_root, folder, "algo.json")) as f:
-                    self.assertEqual(json.load(f)["global_step"], expected_next)
+                async with aiofiles.open(os.path.join(ckpt_root, folder, "algo.json")) as f:
+                    content = await f.read()
+                    self.assertEqual(json.loads(content)["global_step"], expected_next)
                 # the model checkpoint lands alongside it
                 self.assertTrue(os.path.isdir(os.path.join(ckpt_root, folder, "hf")))
         finally:
