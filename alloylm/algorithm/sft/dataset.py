@@ -58,6 +58,7 @@ class SFTPackDataset(Dataset):
 
         self.data = []  # file_idx, offset, num_tokens
         self.packed_data = []
+        self.num_skip_data = 0
         self.rng = random.Random(random_seed)
 
     async def lazy_init(self):
@@ -80,7 +81,7 @@ class SFTPackDataset(Dataset):
                 num_token = file_num_tokens[i]
                 self.data.append((file_idx, offset, num_token))
 
-        self.packed_data = self.pack_data(self.data, self.max_length)
+        self.packed_data, self.num_skip_data = self.pack_data(self.data, self.max_length)
 
     def __len__(self):
         return len(self.packed_data)
@@ -110,11 +111,16 @@ class SFTPackDataset(Dataset):
 
     @classmethod
     def pack_data(cls, data, max_length):
+        num_skip = 0
         packed_data = []
         current_pack = []
         current_length = 0
 
         for i, (_, _, num_tokens) in enumerate(data):
+            if num_tokens > max_length:
+                # Skip this sample if it exceeds max_length
+                num_skip += 1
+                continue
             if current_length + num_tokens > max_length:
                 if current_pack:
                     packed_data.append(current_pack)
@@ -127,7 +133,7 @@ class SFTPackDataset(Dataset):
         if current_pack:
             packed_data.append(current_pack)
 
-        return packed_data
+        return packed_data, num_skip
 
 
 class SFTPackDatasetConfig(BaseModel):
@@ -136,7 +142,7 @@ class SFTPackDatasetConfig(BaseModel):
     max_length: int
     chat_template: Callable[..., str] | None = None
 
-    async def build(self, tokenizer):
+    async def build(self, tokenizer) -> SFTPackDataset:
         dataset = SFTPackDataset(self.file_paths, self.sample_ratios, tokenizer, self.chat_template, self.max_length)
         await dataset.lazy_init()
         return dataset

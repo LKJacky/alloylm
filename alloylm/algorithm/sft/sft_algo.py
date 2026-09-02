@@ -140,10 +140,12 @@ class SFTTrainer:
         # list as we concatenate.
         self.jsonl_paths = []
         self.packs = []
+        num_skip = 0
         for cfg in self.config.datasets:
             cfg.chat_template = self.chat_template
             cfg.max_length = self.config.max_length
             dataset = await cfg.build(self.tokenizer)
+            num_skip += dataset.num_skip_data
             base = len(self.jsonl_paths)
             self.jsonl_paths.extend(dataset.file_paths)
             for pack in dataset.packed_data:
@@ -165,7 +167,7 @@ class SFTTrainer:
 
         total_tokens = sum(sum(p.num_tokens) for p in self.packs)
         self.logger.info(
-            f"SFT data ready: {len(self.packs)} packs, {total_tokens} tokens, {len(self.jsonl_paths)} files, "
+            f"SFT data ready: {len(self.packs)} packs, {total_tokens} tokens, {len(self.jsonl_paths)} files, {num_skip} skipped samples, "
             f"dp_size={self.dp_size}, {self.steps_per_epoch} steps/epoch (global_batch_size={self.config.global_batch_size})."
         )
         if self.config.total_training_steps == -1:
