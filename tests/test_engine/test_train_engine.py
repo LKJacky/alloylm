@@ -45,29 +45,50 @@ class TrainInferEngineTest(CudaAsyncTestCase):
                 ),
                 engine_config=TrainInferEngineConfig(
                     train_config=TrainEngineConfig(
-                        max_length=128,
+                        max_length=1024,
                         work_dir=work_dir,
                         num_workers=1,
-                        total_training_steps=10,
+                        total_training_steps=4,
                     ),
-                    infer_config=InferEngineConfig(model_name="ALLOYLM", memory_usage=0.1),
+                    infer_config=InferEngineConfig(model_name="ALLOYLM", memory_usage=0.2),
                 ),
             )
             await engine.lazy_init()
 
-            for step in range(10):
+            questions = (
+                (
+                    "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. "
+                    "How many clips did Natalia sell altogether in April and May?"
+                ),
+                (
+                    "Weng earns $12 an hour for babysitting. Yesterday, she babysat for 50 minutes. "
+                    "How much did she earn?"
+                ),
+            )
+            system_prompt = "Answer below question and response your final answer in \\boxed"
+
+            # Match the RL test's workload: two prompts, eight stochastic rollouts each,
+            # long generations, and repeated infer/train transitions.
+            for step in range(4):
                 await engine.serve()
                 serving = True
                 client = AsyncClient(api_key="EMPTY", base_url=await engine.get_server_ip())
-                prompts = [[{"role": "user", "content": "What is 2 + 2?"}] for _ in range(2)]
+                prompts = [
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": question},
+                    ]
+                    for question in questions
+                    for _ in range(8)
+                ]
                 responses = await asyncio.gather(
                     *(
                         client.chat.completions.create(
                             model="ALLOYLM",
                             messages=prompt,
-                            max_completion_tokens=8,
-                            temperature=0,
-                            extra_body={"top_k": 1, "ignore_eos": True},
+                            max_completion_tokens=512,
+                            temperature=1.0,
+                            top_p=1.0,
                         )
                         for prompt in prompts
                     )
@@ -89,9 +110,9 @@ class TrainInferEngineTest(CudaAsyncTestCase):
                             "input_ids": rollout["input_ids"],
                             "labels": rollout["labels"],
                             "inference_logprobs": rollout["log_probs"],
-                            "advantages": 1.0,
+                            "advantages": -1.0 if index % 8 < 4 else 1.0,
                         }
-                        for rollout in rollouts
+                        for index, rollout in enumerate(rollouts)
                     ],
                     step=step,
                 )

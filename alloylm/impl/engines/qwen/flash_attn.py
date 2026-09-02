@@ -23,6 +23,16 @@ import torch
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
 
+def _pad_cu_seqlens_storage(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """Provide storage for FlashAttention's invalid varlen padding tiles.
+
+    FlashAttention 4 beta28's SM80/SM120 forward kernel reads one element past the logical cu_seqlens view before
+    rejecting an invalid scheduler tile. Keep the public shape unchanged while backing that read with the final offset.
+    Remove this workaround once upstream PR #2763 is available in a release.
+    """
+    return torch.cat((cu_seqlens, cu_seqlens[-1:]))[:-1]
+
+
 @torch.library.custom_op("alloylm::flash_attn_varlen_fwd", mutates_args=())
 def flash_attn_varlen_fwd(
     q: torch.Tensor,
@@ -37,12 +47,16 @@ def flash_attn_varlen_fwd(
     window_size_left: int | None,
     window_size_right: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    padded_cu_seqlens_q = _pad_cu_seqlens_storage(cu_seqlens_q)
+    padded_cu_seqlens_k = (
+        padded_cu_seqlens_q if cu_seqlens_k is cu_seqlens_q else _pad_cu_seqlens_storage(cu_seqlens_k)
+    )
     out, lse, _, _ = _flash_attn_fwd(
         q,
         k,
         v,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
+        cu_seqlens_q=padded_cu_seqlens_q,
+        cu_seqlens_k=padded_cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         softmax_scale=softmax_scale,
