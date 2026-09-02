@@ -11,7 +11,7 @@ repos:
     rev: v2.4.2
     hooks:
       - id: codespell
-        args: ["--ignore-words-list", "warmup,nin"]
+        args: ["--ignore-words-list", "warmup,nin,dout"]
   - repo: https://github.com/myint/docformatter
     rev: 06907d0
     hooks:

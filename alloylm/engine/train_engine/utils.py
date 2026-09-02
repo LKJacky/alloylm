@@ -234,7 +234,7 @@ class FSDPConfig(PydanticModel):
     infer_mesh: DeviceMesh | dict | None = None  # support 2d mesh: 'dp + tp'
 
     # for fsdp
-    torch_compile: bool = False
+    torch_compile: bool = True
     reshard_after_forward: bool = True
     recompute_ratio: float = 1.0
 

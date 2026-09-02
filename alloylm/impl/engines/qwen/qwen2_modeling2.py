@@ -8,7 +8,6 @@ from typing import Optional, Unpack
 import flashinfer
 import torch
 from accelerate.utils import set_module_tensor_to_device
-from flash_attn.cute import flash_attn_varlen_func
 from torch import distributed as dist
 from torch import nn
 from torch.distributed._composable.fsdp import (
@@ -59,6 +58,7 @@ from alloylm.engine.train_engine.utils import (
     split_for_sequence_parallel,
 )
 
+from .flash_attn import flash_attn_varlen_fwd
 from .moe_layer import Qwen3MoeSparseMoeBlock
 from .swa_cache import AttentionArgs, InferKernel, SwaCacheManager
 
@@ -119,7 +119,6 @@ class Qwen2MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    @torch.compile()
     def forward(self, x):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         down_proj = self.down_proj(self.act_fn(gate) * up)
@@ -161,7 +160,6 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile()
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
@@ -327,7 +325,6 @@ class Qwen2Attention(nn.Module):
         )
         return q_states, layer_k_pool, layer_v_pool
 
-    @torch.compiler.disable
     def forward_training(
         self: "Qwen2Attention",
         query_states: torch.Tensor,
@@ -369,17 +366,18 @@ class Qwen2Attention(nn.Module):
             )
 
         # (bs, n , qh // sp, d)
-        attn_output, _ = flash_attn_varlen_func(
+        attn_output, _ = flash_attn_varlen_fwd(
             query_states.flatten(0, 1),
             key_states.flatten(0, 1),
             value_states.flatten(0, 1),
-            cu_seqlens_q=cu_seq_lens_q,
-            cu_seqlens_k=cu_seq_lens_k,
-            max_seqlen_q=max_length_q,
-            max_seqlen_k=max_length_k,
-            softmax_scale=self.scaling,
-            causal=True,
-            window_size=window_size,
+            cu_seq_lens_q,
+            cu_seq_lens_k,
+            max_length_q,
+            max_length_k,
+            self.scaling,
+            True,
+            window_size[0],
+            window_size[1],
         )
         if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
             attn_output = all_to_all(
@@ -456,7 +454,6 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = QwenRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else "full_attention"
 
-    @torch.compile()
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -849,9 +846,17 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
         for layer in tqdm(model.model.layers, desc="Loading layers"):
             layer.apply(param_init_fn)
             fully_shard(layer, mp_policy=mp_policy, reshard_after_forward=True)
-            attention = layer.self_attn
-            if attention.layer_idx < num_recompute_layers:
-                model.model.layers[layer.self_attn.layer_idx] = checkpoint_wrapper(layer, preserve_rng_state=False)
+            layer_idx = layer.self_attn.layer_idx
+            if layer_idx < num_recompute_layers:
+                layer = checkpoint_wrapper(layer, preserve_rng_state=False)
+            # Compile the whole (checkpoint-wrapped) layer as one graph. Attention
+            # is a custom op (no graph break), so this is the supported
+            # compile(checkpoint(layer)) nesting: Dynamo's checkpoint HOP recomputes
+            # from a stable AOTAutograd partition, avoiding the CheckpointError that
+            # checkpoint(compile(layer)) hit on varlen data.
+            if fsdp_config.torch_compile:
+                layer = torch.compile(layer)
+            model.model.layers[layer_idx] = layer
 
         if config.tie_word_embeddings:
             model.embed_tokens.apply(param_init_fn)
