@@ -833,7 +833,7 @@ class RLTrainer:
 
             for line in timer.format_summary().split("\n"):
                 self.logger.info(line)
-            for key, t in timer.get_summary().items():
+            for key, t in timer.summary().items():
                 self.tb_writer.add_scalar(f"Time/{key}", t, step)
             self.logger.info("----------------------------\n\n")
 
