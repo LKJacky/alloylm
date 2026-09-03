@@ -50,6 +50,7 @@ class DatasetSummary(BaseModel):
     num_overlong: int = -1
     mean_input_tokens: int = -1
     mean_output_tokens: int = -1
+    mean_num_turns: int = -1
 
     origin_num: int = 0
     result_num: int = 0
@@ -62,6 +63,7 @@ class DatasetSummary(BaseModel):
         if len(self.task_data) > 0:
             self.mean_input_tokens = int(sum([d.input_tokens for d in self.task_data]) / len(self.task_data))
             self.mean_output_tokens = int(sum([d.output_tokens for d in self.task_data]) / len(self.task_data))
+            self.mean_num_turns = int(sum([len(d.messages) for d in self.task_data]) / len(self.task_data))
         self.num_overlong = len([d for d in self.task_data if d.finish_reason != "stop"])
 
         self.result_num = len(self.task_data)
