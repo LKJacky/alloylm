@@ -1,3 +1,4 @@
+import asyncio
 import gc
 import os
 import shutil
@@ -42,7 +43,7 @@ class TmpFolder:
         while os.path.exists(self.tmp_folder):
             try:
                 shutil.rmtree(self.tmp_folder)
-            except Exception:
+            except Exception:  # noqa
                 pass
 
 
@@ -63,6 +64,7 @@ class LaunchTestServer:
         max_prefill_length=1024,
         model_path="Qwen/Qwen2.5-1.5B-Instruct",
         shard_dtype=torch.bfloat16,
+        tool_pattern=None,
     ):
         self.engine = SPMDActor.create_spmd_actor(
             SPMDInfer,
@@ -83,6 +85,7 @@ class LaunchTestServer:
                         memory_usage=0.6,
                         max_prefill_length=max_prefill_length,
                         port=port,
+                        tool_pattern=tool_pattern,
                     ),
                 ),
             ),
@@ -105,7 +108,7 @@ class LaunchTestServer:
             torch.cuda.empty_cache()
             if dist.is_initialized():
                 dist.destroy_process_group()
-        except Exception:
+        except Exception:  # noqa
             pass
 
 
@@ -136,6 +139,9 @@ class CudaAsyncTestCase(IsolatedAsyncioTestCase):
         if dist.is_initialized():
             dist.destroy_process_group()
         collect_garbage()
+
+    async def asyncSetUp(self):
+        asyncio.get_running_loop().set_debug(False)
 
     @classmethod
     def tearDownClass(cls):
