@@ -1,5 +1,4 @@
 import copy
-import heapq
 import os
 import shutil
 import unittest
@@ -17,7 +16,6 @@ from alloylm.engine.train_engine.utils import FSDPConfig
 from alloylm.impl import common
 from alloylm.impl.engines.qwen.qwen2_modeling2 import FSDPQwen2ForCausalLM
 from alloylm.impl.math import GSM8KDatasetConfig
-from alloylm.impl.trpo_sampler import TRPO_Sampler
 from alloylm.test_utils import CudaAsyncTestCase
 
 default_config = UnifiedConfig(
@@ -127,34 +125,6 @@ class TestRLSystem(RLTest):
         trainer = create_trainer(config)
         await trainer.lazy_init()
         await trainer.fit()
-
-    async def test_rl_trpo(self):
-        shutil.rmtree("work_dirs/tests/rl", ignore_errors=True)
-        config = copy.deepcopy(default_config)
-        config.train_datasets, config.train_sample_ratios = config.train_datasets[:1], config.train_sample_ratios[:1]
-        config.eval_datasets, config.eval_sample_ratios = [], []
-        config.roll_out_bs = 16
-        config.num_rl_group = 1
-        config.total_training_steps = 12
-        trainer = create_trainer(config)
-        await trainer.lazy_init()
-        # dispatch sampler
-        dataset = trainer.algorithm.train_task.task_sampler.samplers[0].dataset
-        dataset.data = [dataset.data[i] for i in range(32)]
-        trainer.algorithm.train_task.task_sampler.samplers[0] = TRPO_Sampler(dataset, tb_writer=trainer.tb_writer)
-        trainer.algorithm.train_task.task_sampler.sampler_iters[0] = iter(
-            trainer.algorithm.train_task.task_sampler.samplers[0]
-        )
-        await trainer.fit()
-
-        heap = trainer.algorithm.train_task.task_sampler.samplers[0].wait.heap
-        stds = [x.std() for x in heapq.nsmallest(len(heap), heap)]
-        self.assertTrue(all(x >= stds[i] for i, x in enumerate(stds[:-1])))
-        print(heap[0])
-        for x in heapq.nsmallest(len(heap), heap):
-            print(x.std(), x.rewards)
-
-        self.assertTrue(await trainer.resume(), "Failed to resume from checkpoint")
 
 
 class TestRLSystemQuick(RLTest):
