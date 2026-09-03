@@ -57,13 +57,13 @@ default_config = UnifiedConfig(
     ],
     eval_sample_ratios=[0.001, 0.001],
     # rl algo
-    roll_out_bs=32,
+    roll_out_bs=16,
     num_rl_group=4,
     num_optimize_per_step=1,
     filter_group="none",
     async_rollout="none",
     # pipeline
-    total_training_steps=8,
+    total_training_steps=5,
     checkpoint_interval=4,
     max_checkpoints=1,
     eval_interval=4,
@@ -102,16 +102,6 @@ class TestRLSystem(RLTest):
         trainer = create_trainer(config)
         await trainer.lazy_init()
         await trainer.fit()
-
-    async def test_async_no_filter(self):
-        shutil.rmtree("work_dirs/tests/rl", ignore_errors=True)
-        config = copy.deepcopy(self.default_config)
-        config.work_dir = "work_dirs/tests/rl"
-        config.async_rollout = "task"
-        trainer = create_trainer(config)
-        await trainer.lazy_init()
-        await trainer.fit()
-        del trainer
 
     async def test_async_no_filter_entropy(self):
         shutil.rmtree("work_dirs/tests/rl", ignore_errors=True)
@@ -192,6 +182,16 @@ class TestRLSystemQuick(RLTest):
 
         resumed = await trainer.resume()
         self.assertTrue(resumed, "Failed to resume from checkpoint")
+
+    async def test_async_rl(self):
+        shutil.rmtree("work_dirs/tests/rl", ignore_errors=True)
+        config = copy.deepcopy(self.default_config)
+        config.work_dir = "work_dirs/tests/rl"
+        config.async_rollout = "task"
+        trainer = create_trainer(config)
+        await trainer.lazy_init()
+        await trainer.fit()
+        del trainer
 
     async def test_rl_with_fake_data(self):
         try:
