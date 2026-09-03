@@ -1,8 +1,10 @@
 import asyncio
+import json
+import re
 import traceback
 import uuid
 from queue import Queue
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union  # noqa: UP035
 
 import httpx
 import jinja2
@@ -11,6 +13,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response
 from jinja2 import Template
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+from openai.types.chat.chat_completion_tool_union_param import (
+    ChatCompletionToolUnionParam,
+)
 from pydantic import BaseModel, Field
 from pydantic import BaseModel as _BaseModel
 from transformers import AutoTokenizer
@@ -92,7 +97,7 @@ class ChatCompletionRequest(BaseModel):
     messages: Union[str, List[Dict[str, Any]]] = Field(examples=[[{"role": "user", "content": "hi"}]])  # noqa
     temperature: float | None = 0.7
     top_p: float | None = 1.0
-    # tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    tools: list[ChatCompletionToolUnionParam] | None = Field(default=None, examples=[None])
     # tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
     #     default="auto", examples=["none"]
     # )
@@ -124,9 +129,9 @@ class Messages:
         self.messages = []
         self.cached_text = ""
 
-    def render_messages(self, new_messages, for_generate=False):
+    def render_messages(self, new_messages, for_generate=False, tools=None):
         self.messages.extend(new_messages)
-        text = self._get_text(add_generation_prompt=for_generate)
+        text = self._get_text(add_generation_prompt=for_generate, tools=tools)
         assert text.startswith(self.cached_text), (
             f"New text should start with cached text, but got:\nCached:\n{self.cached_text}\nNew:\n{text}"
         )
@@ -134,13 +139,15 @@ class Messages:
         self.cached_text = text
         return diff_text
 
-    def _get_text(self, add_generation_prompt=True):
+    def _get_text(self, add_generation_prompt=True, tools=None):
         try:
             return self.chat_template.render(
-                messages=self.messages, add_generation_prompt=add_generation_prompt, enable_thinking=False
+                messages=self.messages, add_generation_prompt=add_generation_prompt, enable_thinking=False, tools=tools
             )
-        except Exception:
-            return self.chat_template.render(messages=self.messages, add_generation_prompt=add_generation_prompt)
+        except Exception:  # noqa
+            return self.chat_template.render(
+                messages=self.messages, add_generation_prompt=add_generation_prompt, tools=tools
+            )
 
 
 class SessionItem:
@@ -153,8 +160,39 @@ class SessionItem:
     def forward_tokens(self, tokens):
         self.forwarded_tokens += tokens
 
-    def render_messages(self, new_messages, for_generate=False):
-        return self.messages.render_messages(new_messages, for_generate=for_generate)
+    def render_messages(self, new_messages, for_generate=False, tools=None):
+        return self.messages.render_messages(new_messages, for_generate=for_generate, tools=tools)
+
+
+def parse_tool_calls(text: str, tool_pattern: re.Pattern) -> tuple[str, list[dict]]:
+    matches = list(tool_pattern.finditer(text))
+    if not matches:
+        return text, []
+
+    tool_calls = []
+    try:
+        for match in matches:
+            payload = json.loads(match.group(1))
+            name = payload["name"]
+            arguments = payload.get("arguments", {})
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
+            if not isinstance(name, str) or not isinstance(arguments, (dict, list)):
+                raise ValueError("Invalid tool call payload")  # noqa: TRY004
+            tool_calls.append(
+                {
+                    "id": f"call_{uuid.uuid4().hex}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+                    },
+                }
+            )
+        content = tool_pattern.sub("", text).strip()
+        return content or None, tool_calls
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return text, []
 
 
 # server
@@ -164,11 +202,12 @@ class APIServer:
     def __init__(
         self,
         tokenizer: AutoTokenizer,
+        queue: Queue[GeneConfig],
         chat_template: Template = None,
-        queue: Queue[GeneConfig] = Queue(),
         port=8000,
         proxy_url=None,
         model_name="",
+        tool_pattern: str | None = None,
     ):
         self.tokenizer = tokenizer
         jinja_env = ImmutableSandboxedEnvironment(
@@ -201,6 +240,7 @@ class APIServer:
         get_logger().info(
             f"Use eos token {self.tokenizer.eos_token}({self.tokenizer.eos_token_id}) as default stop token"
         )
+        self.tool_pattern = re.compile(tool_pattern, re.DOTALL) if tool_pattern else None
 
     # session management
 
@@ -240,7 +280,7 @@ class APIServer:
                 while not server.started:
                     await asyncio.sleep(0.001)
                 break
-            except Exception as e:
+            except Exception as e:  # noqa
                 get_logger().error(f"Failed to launch API server on port {self.port}: {e}")
                 get_logger().error("Retrying in 1 second...")
                 self.port += 1  # Increment port to avoid conflicts
@@ -285,9 +325,23 @@ class APIServer:
         )
 
         session: SessionItem = self.get_session(uuid.uuid4().int)
-        text = session.render_messages(request.messages, for_generate=True)
+        text = session.render_messages(request.messages, for_generate=True, tools=request.tools)
         response, input_ids, result = await self.run_infer(session, gene_config, text=text)
         self.session_map.pop(session.session_id, None)
+        if self.tool_pattern:
+            content, tool_calls = parse_tool_calls(response, tool_pattern=self.tool_pattern)
+        else:
+            content, tool_calls = response, []
+
+        message = {
+            "role": "assistant",
+            "content": content,
+            "output_ids": result["tokens"],
+            "input_ids": input_ids,
+            "logprobs": [0] * len(input_ids) + result["log_prob"],
+        }
+        if tool_calls:
+            message["tool_calls"] = tool_calls
 
         return {
             "id": str(session.session_id),
@@ -297,21 +351,15 @@ class APIServer:
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": response,
-                        "output_ids": result["tokens"],
-                        "input_ids": input_ids,
-                        "logprobs": [0] * len(input_ids) + result["log_prob"],
-                    },
-                    "finish_reason": result["finish_reason"],
+                    "message": message,
+                    "finish_reason": "tool_calls" if tool_calls else result["finish_reason"],
                 }
             ],
-            "usage": dict(
-                completion_tokens=result["usage"]["output_tokens"],
-                prompt_tokens=result["usage"]["input_tokens"],
-                total_tokens=result["usage"]["output_tokens"] + result["usage"]["input_tokens"],
-            ),
+            "usage": {
+                "completion_tokens": result["usage"]["output_tokens"],
+                "prompt_tokens": result["usage"]["input_tokens"],
+                "total_tokens": result["usage"]["output_tokens"] + result["usage"]["input_tokens"],
+            },
         }
 
     async def chat_interactive(self, request: InteractiveRequest):
@@ -356,7 +404,7 @@ class APIServer:
                         "finish_reason": result["finish_reason"],
                     }
                 )
-        except Exception as e:
+        except Exception as e:  # noqa
             get_logger().error(f"Error in chat_interactive: {e}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(e) + "\n" + traceback.format_exc())
 
@@ -390,7 +438,9 @@ class APIServer:
             },
         }
 
-    async def abort_request(self, request: dict = {}):
+    async def abort_request(self, request: dict | None = None):
+        if request is None:
+            request = {}
         await self.run_on_engine(ReleaseItem(-1))
         return {"status": "success"}
 
@@ -416,7 +466,7 @@ class APIServer:
                 self.server.force_exit = True
                 try:
                     await self.task
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     get_logger().error(f"Error while forcing API server shutdown: {e}")
             self.task = None
             self.server = None

@@ -30,6 +30,8 @@ class InferEngineConfig(PydanticBaseModel):
     port: int | None = None
     proxy_url: str | None = None
 
+    tool_pattern: str | None = None
+
 
 class InferEngine:
     def __init__(
@@ -91,6 +93,7 @@ class InferEngine:
             port=server_port,
             proxy_url=proxy_url,
             model_name=engine_config.model_name,
+            tool_pattern=engine_config.tool_pattern,
         )
 
         self.gather_context = GatherContext(model)
