@@ -26,7 +26,7 @@ def load_jsonl(path: str) -> list[dict]:
 async def save_to_file(queue: asyncio.Queue, file_path: str):
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     if os.path.exists(file_path):
-        shutil.copy(file_path, file_path + ".bak")
+        shutil.move(file_path, file_path + ".bak")
     cached = []
     last_save_time = time.time()
     async with aiofiles.open(file_path, "a", encoding="utf-8") as f:
