@@ -1,1 +1,3 @@
-QWEN_TOOL_PATTERN = r"<tool_call>\s*(.*?)\s*</tool_call>"
+from .chat_template import QWEN_TOOL_PATTERN, Qwen3ChatTemplate
+
+__all__ = ["QWEN_TOOL_PATTERN", "Qwen3ChatTemplate"]

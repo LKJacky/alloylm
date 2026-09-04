@@ -1,7 +1,12 @@
+import copy
+import re
+import unittest
+
 import torch
 from transformers import AutoTokenizer
 
 from alloylm.engine.spmd import init_dist
+from alloylm.impl.engines.qwen import Qwen3ChatTemplate
 from alloylm.impl.engines.qwen.qwen2_modeling2 import (
     FSDPConfig,
     FSDPQwen2ForCausalLM,
@@ -194,3 +199,134 @@ class TestQwenModel(CudaAsyncTestCase):
             del cache
             self.model.train_shard()
             collect_garbage()
+
+
+class TestQwen3ChatTemplate(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
+
+    def render_official(self, messages, **kwargs):
+        return self.tokenizer.apply_chat_template(messages, tokenize=False, **kwargs)
+
+    @staticmethod
+    def extract_reasoning(rendered):
+        return re.findall(r"<think>\n(.*?)\n</think>", rendered, re.DOTALL)
+
+    def test_render_basic_conversation(self):
+        messages = [
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi", "reasoning_content": "greet"},
+        ]
+
+        rendered = Qwen3ChatTemplate.render(messages)
+        expected_reasoning = self.extract_reasoning(self.render_official(messages))
+
+        for reasoning in expected_reasoning:
+            self.assertIn(reasoning, rendered)
+
+    def test_preserves_reasoning_across_turns(self):
+        messages = [
+            {"role": "user", "content": "First question"},
+            {
+                "role": "assistant",
+                "content": "First answer",
+                "reasoning_content": "reasoning from the first turn",
+            },
+            {"role": "user", "content": "Follow-up question"},
+            {
+                "role": "assistant",
+                "content": "Final answer",
+                "reasoning_content": "reasoning from the final turn",
+            },
+        ]
+
+        rendered = Qwen3ChatTemplate.render(messages)
+        official_conversation = self.render_official(messages)
+        expected_reasoning = [
+            *self.extract_reasoning(self.render_official(messages[:2])),
+            *self.extract_reasoning(self.render_official(messages[2:])),
+        ]
+
+        self.assertLess(len(self.extract_reasoning(official_conversation)), len(expected_reasoning))
+        for reasoning in expected_reasoning:
+            self.assertEqual(rendered.count(reasoning), 1)
+        self.assertLess(rendered.index(expected_reasoning[0]), rendered.index(expected_reasoning[1]))
+
+    def test_generation_prompt_is_prefix_of_completed_assistant(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        prompt = Qwen3ChatTemplate.render(
+            messages,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        completed = Qwen3ChatTemplate.render(
+            messages + [{"role": "assistant", "content": "Hi"}],
+            enable_thinking=False,
+        )
+
+        self.assertTrue(completed.startswith(prompt), (prompt, completed))
+
+    def test_tools_do_not_mutate_messages(self):
+        messages = [
+            {"role": "system", "content": "Use tools."},
+            {"role": "user", "content": "Count"},
+        ]
+        original = copy.deepcopy(messages)
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "increment",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        first = Qwen3ChatTemplate.render(messages, tools=tools)
+        second = Qwen3ChatTemplate.render(messages, tools=tools)
+
+        self.assertEqual(messages, original)
+        self.assertEqual(first, second)
+        self.assertEqual(first.count("# Tools"), 1)
+        self.assertIn('"name": "increment"', first)
+
+    def test_render_tool_call_with_none_content(self):
+        messages = [
+            {"role": "user", "content": "Add values"},
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": None,
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "add",
+                            "arguments": {"b": 2, "a": 1},
+                        }
+                    }
+                ],
+            },
+        ]
+
+        rendered = Qwen3ChatTemplate.render(messages)
+
+        self.assertNotIn("None", rendered)
+        self.assertIn(
+            '<tool_call>\n{"name": "add", "arguments": {"a": 1, "b": 2}}\n</tool_call>',
+            rendered,
+        )
+
+    def test_generation_prompt_with_thinking_enabled(self):
+        rendered = Qwen3ChatTemplate.render(
+            [{"role": "user", "content": "Think"}],
+            add_generation_prompt=True,
+            enable_thinking=True,
+        )
+
+        self.assertTrue(rendered.endswith("<|im_start|>assistant\n<think>\n\n"))
+
+
+if __name__ == "__main__":
+    unittest.main()
