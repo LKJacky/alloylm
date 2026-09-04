@@ -65,6 +65,7 @@ class LaunchTestServer:
         model_path="Qwen/Qwen2.5-1.5B-Instruct",
         shard_dtype=torch.bfloat16,
         tool_pattern=None,
+        chat_template=None,
     ):
         self.engine = SPMDActor.create_spmd_actor(
             SPMDInfer,
@@ -86,6 +87,7 @@ class LaunchTestServer:
                         max_prefill_length=max_prefill_length,
                         port=port,
                         tool_pattern=tool_pattern,
+                        chat_template=chat_template,
                     ),
                 ),
             ),

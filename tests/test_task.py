@@ -3,7 +3,7 @@ import asyncio
 from alloylm.algorithm.base import InferArgs
 from alloylm.algorithm.eval.base import EvalRunner
 from alloylm.impl.count_to_n import CountToNDatasetConfig
-from alloylm.impl.engines.qwen import QWEN_TOOL_PATTERN
+from alloylm.impl.engines.qwen import QWEN_TOOL_PATTERN, Qwen3ChatTemplate
 from alloylm.impl.math import GSM8KDatasetConfig, GSM8KTask
 from alloylm.test_utils import CudaAsyncTestCase, LaunchTestServer
 
@@ -18,7 +18,7 @@ class TestTask(CudaAsyncTestCase):
 
     async def test_count_to_n_task(self):
         async with LaunchTestServer(
-            model_path="Qwen/Qwen3-0.6B", tool_pattern=QWEN_TOOL_PATTERN
+            model_path="Qwen/Qwen3-0.6B", tool_pattern=QWEN_TOOL_PATTERN, chat_template=Qwen3ChatTemplate
         ):  # qwen3 has better agentic performance Qwen2.5, hence we use it for this test
             dataset = await CountToNDatasetConfig(
                 max_target=32,
@@ -31,4 +31,4 @@ class TestTask(CudaAsyncTestCase):
             summary = await runner.run(asyncio.Semaphore(64))
             print("accuracy:", summary.metric)
 
-            self.assertGreater(summary.metric, 0.2)
+            self.assertGreater(summary.metric, 0.6)

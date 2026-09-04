@@ -98,21 +98,20 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = 0.7
     top_p: float | None = 1.0
     tools: list[ChatCompletionToolUnionParam] | None = Field(default=None, examples=[None])
-    # tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
-    #     default="auto", examples=["none"]
-    # )
+    stop: Optional[Union[str, List[str]]] = Field(default=None, examples=[None])  # noqa
+    max_completion_tokens: int | None = None
+    max_tokens: int | None = None  # duplicate of max_completion_tokens
+
+    # extra body
+    top_k: int | None = 40
+    session_id: int = -1
+    max_entropy: float = 100.0
+
+    # unsupported params
     logprobs: bool | None = False
     top_logprobs: int | None = None
     n: int | None = 1
     logit_bias: Optional[Dict[str, float]] = Field(default=None, examples=[None])  # noqa
-    stop: Optional[Union[str, List[str]]] = Field(default=None, examples=[None])  # noqa
-
-    max_completion_tokens: int | None = None
-    max_tokens: int | None = None  # duplicate of max_completion_tokens
-
-    # extra
-    top_k: int | None = 40
-    extra_body: dict[str, Any] | None = None
 
     def clean(self):
         if self.max_completion_tokens is not None and self.max_tokens is not None:
@@ -313,6 +312,31 @@ class APIServer:
 
     async def chat_completion(self, request: ChatCompletionRequest):
         request.clean()
+        if request.session_id == -1:
+            request.session_id = uuid.uuid4().int  # generate a new session id for this request
+            release_at_once = True
+        else:
+            release_at_once = False
+            if len(request.messages) == 0:  # release session
+                await self.release_session(request.session_id)
+                return {
+                    "id": str(request.session_id),
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": request.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": [],
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "completion_tokens": 0,
+                        "prompt_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                }
 
         gene_config = GeneConfig(
             top_p=request.top_p,
@@ -320,14 +344,25 @@ class APIServer:
             total_max_length=request.max_completion_tokens,
             top_k=request.top_k,
             stop_token=request.stop,
-            max_entropy=request.extra_body.get("max_entropy", 100) if request.extra_body else 100,
-            release_at_once=True,
+            max_entropy=request.max_entropy,
+            release_at_once=release_at_once,
         )
 
-        session: SessionItem = self.get_session(uuid.uuid4().int)
-        text = session.render_messages(request.messages, for_generate=True, tools=request.tools)
+        session: SessionItem = self.get_session(request.session_id)
+        # get input text
+        new_messages = request.messages[len(session.messages.messages) :]
+        text = session.render_messages(new_messages, for_generate=True, tools=request.tools)
+        # generate
         response, input_ids, result = await self.run_infer(session, gene_config, text=text)
-        self.session_map.pop(session.session_id, None)
+        # update session
+        if release_at_once:
+            self.session_map.pop(session.session_id, None)
+        else:
+            session.messages.cached_text += response
+            session.messages.messages.append(
+                {"role": "assistant", "content": response}
+            )  # for text recovery, we save pure text content.
+        # parse tools
         if self.tool_pattern:
             content, tool_calls = parse_tool_calls(response, tool_pattern=self.tool_pattern)
         else:
@@ -357,8 +392,12 @@ class APIServer:
             ],
             "usage": {
                 "completion_tokens": result["usage"]["output_tokens"],
-                "prompt_tokens": result["usage"]["input_tokens"],
-                "total_tokens": result["usage"]["output_tokens"] + result["usage"]["input_tokens"],
+                "prompt_tokens": result["usage"]["history_tokens"] + result["usage"]["input_tokens"],
+                "total_tokens": (
+                    result["usage"]["history_tokens"]
+                    + result["usage"]["input_tokens"]
+                    + result["usage"]["output_tokens"]
+                ),
             },
         }
 

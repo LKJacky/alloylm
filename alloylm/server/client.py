@@ -3,6 +3,7 @@ import copy
 import os
 import traceback
 import uuid
+from functools import partial
 from typing import Any, Optional
 
 import aiohttp
@@ -10,6 +11,32 @@ import httpx
 from openai import NOT_GIVEN, AsyncClient, NotGiven
 from openai.types.chat.chat_completion import ChatCompletion
 from pydantic import BaseModel, Field
+
+
+def enable_interactive_session(client: AsyncClient):
+    """Give a client an isolated server-side session and release it on
+    close."""
+    session_id = uuid.uuid4().int
+    create = client.chat.completions.create
+    if isinstance(create, partial):
+        keywords = copy.deepcopy(create.keywords)
+        extra_body = dict(keywords.get("extra_body") or {})
+        extra_body["session_id"] = session_id
+        keywords["extra_body"] = extra_body
+        client.chat.completions.create = partial(create.func, *create.args, **keywords)
+    else:
+        client.chat.completions.create = partial(create, extra_body={"session_id": session_id})
+
+    original_close = client.close
+
+    async def close_with_session_id():
+        try:
+            await client.chat.completions.create(messages=[], model="")
+        finally:
+            await original_close()
+
+    client.close = close_with_session_id
+    return client
 
 
 class SharedSession:

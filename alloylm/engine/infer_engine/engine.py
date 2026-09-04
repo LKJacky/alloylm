@@ -25,7 +25,7 @@ logger = get_logger()
 class InferEngineConfig(PydanticBaseModel):
     model_name: str
     memory_usage: float = 0.8
-    chat_template: str | None = None
+    chat_template: object | None = None
     max_prefill_length: int = 16 * 1024
     port: int | None = None
     proxy_url: str | None = None

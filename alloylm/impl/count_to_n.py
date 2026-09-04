@@ -1,9 +1,11 @@
 # A simple example of agent
+
 from openai import AsyncClient
 
 from alloylm.algorithm.base import Dataset, DatasetConfig, Task, TaskData, TaskItem
 from alloylm.impl.agent.agent import BaseAgent
 from alloylm.impl.agent.env import BaseEnv
+from alloylm.server.client import enable_interactive_session
 
 
 class CountToNEnv(BaseEnv):
@@ -50,7 +52,7 @@ class CountToNDataset(Dataset):
                     {
                         "role": "system",
                         "content": (
-                            "You control a counter only through tool calls. Call increment or decrement to change the counter. Your goal is to reach the target value. You can also call get_count to check the current value of the counter."
+                            "You control a counter only through tool calls. Call increment or decrement to change the counter. Your goal is to reach the target value and then stop."
                         ),
                     },
                     {
@@ -75,7 +77,7 @@ class CountToNTask(Task):
         env = CountToNEnv(target)
         client = task_data.infer_args.get_client(client_type=AsyncClient)
         agent = BaseAgent(client, env=env, max_steps=target * 2)
-
+        client = enable_interactive_session(client)
         try:
             task_data.messages = await agent.solve(messages=task_data.messages)
 

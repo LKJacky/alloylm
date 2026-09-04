@@ -1,41 +1,20 @@
 import asyncio
-import json
 import os
 import random
 import unittest
-import uuid
-
-from huggingface_hub import try_to_load_from_cache
 
 from alloylm.engine.infer_engine.utils import get_logger
 from alloylm.server.client import HighConcurrentClient as AsyncClient
+from alloylm.server.client import enable_interactive_session
 from alloylm.test_utils import CudaAsyncTestCase, LaunchTestServer
-
-
-def _hf_model_cached(model_id: str) -> bool:
-    """Return True only if the model weights (safetensors/bin files) are in the
-    HF cache."""
-    index = try_to_load_from_cache(model_id, "model.safetensors.index.json")
-    if index is None or index == "model.safetensors.index.json":
-        # Try single-file model
-        shard = try_to_load_from_cache(model_id, "model.safetensors")
-        return shard is not None and shard != "model.safetensors" and os.path.isfile(shard)
-    # Multi-shard model: verify the first shard file exists
-    try:
-        with open(index) as f:
-            data = json.load(f)
-        first_shard = next(iter(data.get("weight_map", {}).values()))
-        path = try_to_load_from_cache(model_id, first_shard)
-        return path is not None and path != first_shard and os.path.isfile(path)
-    except Exception:
-        return False
-
 
 logger = get_logger()
 
 
 class TestLaunchSystem(CudaAsyncTestCase):
     async def try_forward_interactive(self, port=8000):
+        from openai import AsyncClient
+
         all_prompts = [
             [
                 (
@@ -53,25 +32,25 @@ class TestLaunchSystem(CudaAsyncTestCase):
             ],
         ]
         client = AsyncClient(api_key="EMPTY", base_url=f"http://localhost:{port}/v1")
-        cur_uuid = uuid.uuid4().int
+        client = enable_interactive_session(client)
         prompt = random.choice(all_prompts)
+        messages = []
         for p, answer in prompt:
-            output = (
-                await client.chat_interactive_v1(
-                    prompt=p["content"],
-                    request_output_len=4096,
-                    stop=["<|im_end|>"],
-                    top_k=1,
-                    session_id=cur_uuid,
-                    stream=False,
-                    interactive_mode=True,
-                )
-            )["text"]
-        self.assertTrue(
-            answer.lower() in output.lower(),
-            msg=f"Interactive Test failed: Prompt: {p['content']}, Expected '{answer}', got '{output}'",
-        )
-        await client.end_session(cur_uuid)
+            messages.append(p)
+            output = await client.chat.completions.create(
+                model="ALLOYLM",
+                messages=messages,
+                max_completion_tokens=4096,
+                extra_body={"top_k": 1},
+            )
+            output_str = output.choices[0].message.content
+            messages.append({"role": "assistant", "content": output_str})
+
+            self.assertTrue(
+                answer.lower() in output_str.lower(),
+                msg=f"Interactive Test failed: Prompt: {p['content']}, Expected '{answer}', got '{output_str}'",
+            )
+
         await client.close()
 
     async def try_forward_complete(self, port=8000):
