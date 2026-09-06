@@ -62,8 +62,16 @@ class TestQwen2Modeling(CudaAsyncTestCase):
                 SPMDModelConfig(
                     model_path=model_path,
                     fsdp_config=FSDPConfig(
-                        train_mesh=dict(device_type="cuda", mesh_shape=(world_size, 1), mesh_dim_names=["fsdp", "sp"]),
-                        infer_mesh=dict(device_type="cuda", mesh_shape=(1, world_size), mesh_dim_names=["dp", "tp"]),
+                        train_mesh={
+                            "device_type": "cuda",
+                            "mesh_shape": (world_size, 1),
+                            "mesh_dim_names": ["fsdp", "sp"],
+                        },
+                        infer_mesh={
+                            "device_type": "cuda",
+                            "mesh_shape": (1, world_size),
+                            "mesh_dim_names": ["dp", "tp"],
+                        },
                         lm_head_dtype=torch.bfloat16,
                     ),
                 ),
@@ -166,8 +174,8 @@ class TestQwen3Moe(CudaAsyncTestCase):
                     FSDPQwen2ForCausalLM(
                         config,
                         fsdp_config=FSDPConfig(
-                            train_mesh=dict(device_type="cuda", mesh_shape=(1, 1), mesh_dim_names=["fsdp", "sp"]),
-                            infer_mesh=dict(device_type="cuda", mesh_shape=(1, 1), mesh_dim_names=["dp", "tp"]),
+                            train_mesh={"device_type": "cuda", "mesh_shape": (1, 1), "mesh_dim_names": ["fsdp", "sp"]},
+                            infer_mesh={"device_type": "cuda", "mesh_shape": (1, 1), "mesh_dim_names": ["dp", "tp"]},
                             lm_head_dtype=torch.bfloat16,
                         ),
                     )
@@ -204,12 +212,12 @@ class TestQwen3Moe(CudaAsyncTestCase):
                 model_loaded = FSDPQwen2ForCausalLM.from_pretrained(
                     "work_dirs/tests/moe_hf",
                     fsdp_config=FSDPConfig(
-                        train_mesh=dict(device_type="cuda", mesh_shape=(1, 1), mesh_dim_names=["fsdp", "sp"]),
-                        infer_mesh=dict(device_type="cuda", mesh_shape=(1, 1), mesh_dim_names=["dp", "tp"]),
+                        train_mesh={"device_type": "cuda", "mesh_shape": (1, 1), "mesh_dim_names": ["fsdp", "sp"]},
+                        infer_mesh={"device_type": "cuda", "mesh_shape": (1, 1), "mesh_dim_names": ["dp", "tp"]},
                         lm_head_dtype=torch.bfloat16,
                     ),
                 )
-            except Exception as e:
+            except Exception as e:  # noqa
                 self.fail(f"Failed to load model from HF format: {e}")
         finally:
             if model_alloylm is not None:
@@ -235,8 +243,16 @@ class TestSPMDQwen2(CudaAsyncTestCase):
                 SPMDModelConfig(
                     model_path="Qwen/Qwen3-0.6B",
                     fsdp_config=FSDPConfig(
-                        train_mesh=dict(device_type="cuda", mesh_shape=(world_size, 1), mesh_dim_names=["fsdp", "sp"]),
-                        infer_mesh=dict(device_type="cuda", mesh_shape=(1, world_size), mesh_dim_names=["dp", "tp"]),
+                        train_mesh={
+                            "device_type": "cuda",
+                            "mesh_shape": (world_size, 1),
+                            "mesh_dim_names": ["fsdp", "sp"],
+                        },
+                        infer_mesh={
+                            "device_type": "cuda",
+                            "mesh_shape": (1, world_size),
+                            "mesh_dim_names": ["dp", "tp"],
+                        },
                         lm_head_dtype=torch.bfloat16,
                     ),
                 )
@@ -259,8 +275,8 @@ class TestSPMDQwen2(CudaAsyncTestCase):
                         path="Qwen/Qwen3-0.6B",
                         model_cls=FSDPQwen2ForCausalLM,
                         fsdp_config=FSDPConfig(
-                            train_mesh=dict(device_type="cuda", mesh_shape=(1, 1), mesh_dim_names=["fsdp", "sp"]),
-                            infer_mesh=dict(device_type="cuda", mesh_shape=(1, 1), mesh_dim_names=["dp", "tp"]),
+                            train_mesh={"device_type": "cuda", "mesh_shape": (1, 1), "mesh_dim_names": ["fsdp", "sp"]},
+                            infer_mesh={"device_type": "cuda", "mesh_shape": (1, 1), "mesh_dim_names": ["dp", "tp"]},
                             lm_head_dtype=torch.bfloat16,
                         ),
                     ),
@@ -275,7 +291,9 @@ class TestSPMDQwen2(CudaAsyncTestCase):
         )
 
         await engine.launch()
-        dataset = await GSM8KDatasetConfig(infer_args=InferArgs(model_name="ALLOYLM")).build()
+        dataset = await GSM8KDatasetConfig(
+            infer_args=InferArgs(model_name="ALLOYLM", sample_args={"extra_body": {"top_k": 1}})
+        ).build()
         task_item = dataset[0]
         task_data = await GSM8KTask.run_and_eval(task_item.task_data)
         self.assertTrue(task_data.metric == 1.0)

@@ -25,9 +25,11 @@ class TestScheduler(CudaAsyncTestCase):
         )
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         cache = model.create_cache(memory_usage=0.6)
+        task_queue = asyncio.Queue()
         scheduler = SchedulerServer(
             model=model,
             cache=cache,
+            task_queue=task_queue,
             max_prefill_length=1024,
             real_vocab_size=model.get_real_vocab_size(tokenizer),
         )
@@ -67,7 +69,7 @@ class TestScheduler(CudaAsyncTestCase):
             baseline_cache_usage = cache.cache_usage()
 
             for session in sessions:
-                await scheduler.wait_queue.put(session)
+                await task_queue.put(session)
 
             await asyncio.wait_for(
                 asyncio.gather(*(session.finished_event.wait() for session in sessions)),
