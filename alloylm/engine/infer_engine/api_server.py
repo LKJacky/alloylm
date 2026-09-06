@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Union  # noqa: UP035
 
 import httpx
 import jinja2
+import ray
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response
@@ -20,6 +21,7 @@ from pydantic import BaseModel, Field
 from pydantic import BaseModel as _BaseModel
 from transformers import AutoTokenizer
 
+from .infer_bank import InferBank
 from .scheduler import InferItem, ReleaseItem, ResetItem, TaskItem
 from .utils import GeneConfig, get_current_ip, get_logger
 
@@ -106,6 +108,7 @@ class ChatCompletionRequest(BaseModel):
     top_k: int | None = 40
     session_id: int = -1
     max_entropy: float = 100.0
+    for_training: bool = False
 
     # unsupported params
     logprobs: bool | None = False
@@ -126,10 +129,12 @@ class Messages:
     def __init__(self, chat_template):
         self.chat_template = chat_template
         self.messages = []
+        self.formated_messages = []
         self.cached_text = ""
 
     def render_messages(self, new_messages, for_generate=False, tools=None):
         self.messages.extend(new_messages)
+        self.formated_messages.extend(new_messages)
         text = self._get_text(add_generation_prompt=for_generate, tools=tools)
         assert text.startswith(self.cached_text), (
             f"New text should start with cached text, but got:\nCached:\n{self.cached_text}\nNew:\n{text}"
@@ -153,6 +158,9 @@ class SessionItem:
     def __init__(self, session_id, chat_template: Template):
         self.session_id = session_id
         self.forwarded_tokens = 0
+        self.training_input_ids = []
+        self.training_labels = []
+        self.training_logprobs = []
 
         self.messages = Messages(chat_template)
 
@@ -241,6 +249,8 @@ class APIServer:
         )
         self.tool_pattern = re.compile(tool_pattern, re.DOTALL) if tool_pattern else None
 
+        self.cached_infer_info = {}
+
     # session management
 
     def get_session(self, session_id) -> SessionItem:
@@ -251,10 +261,20 @@ class APIServer:
             self.session_map[session_id] = SessionItem(session_id, self.chat_template)
             return self.session_map[session_id]
 
-    async def release_session(self, session_id):
+    async def release_session(self, session_id, release_cache=True, save_infer_info=False):
         session = self.session_map.pop(session_id, None)
         if session is not None:
-            await self.run_on_engine(ResetItem(session.session_id))
+            if release_cache:
+                await self.run_on_engine(ResetItem(session.session_id))
+            if save_infer_info:
+                # save training data to ray object store for later training
+                self.cached_infer_info[InferBank.hash_messages(session.messages.formated_messages)] = ray.put(
+                    {
+                        "input_ids": session.training_input_ids,
+                        "labels": session.training_labels,
+                        "inference_logprobs": session.training_logprobs,
+                    }
+                )
 
     # apis
 
@@ -318,7 +338,7 @@ class APIServer:
         else:
             release_at_once = False
             if len(request.messages) == 0:  # release session
-                await self.release_session(request.session_id)
+                await self.release_session(request.session_id, save_infer_info=request.for_training)
                 return {
                     "id": str(request.session_id),
                     "object": "chat.completion",
@@ -354,29 +374,34 @@ class APIServer:
         text = session.render_messages(new_messages, for_generate=True, tools=request.tools)
         # generate
         response, input_ids, result = await self.run_infer(session, gene_config, text=text)
-        # update session
-        if release_at_once:
-            self.session_map.pop(session.session_id, None)
-        else:
-            session.messages.cached_text += response
-            session.messages.messages.append(
-                {"role": "assistant", "content": response}
-            )  # for text recovery, we save pure text content.
         # parse tools
         if self.tool_pattern:
-            content, tool_calls = parse_tool_calls(response, tool_pattern=self.tool_pattern)
+            respone_formated, tool_calls = parse_tool_calls(response, tool_pattern=self.tool_pattern)
         else:
-            content, tool_calls = response, []
+            respone_formated, tool_calls = response, []
 
         message = {
             "role": "assistant",
-            "content": content,
-            "output_ids": result["tokens"],
-            "input_ids": input_ids,
-            "logprobs": [0] * len(input_ids) + result["log_prob"],
+            "content": respone_formated,
         }
         if tool_calls:
             message["tool_calls"] = tool_calls
+
+        # update session
+        session.messages.cached_text += response
+        session.messages.messages.append(
+            {"role": "assistant", "content": response}
+        )  # for text recovery, we save pure text content.
+        session.messages.formated_messages.append(message)
+        if request.for_training:
+            output_ids = result["tokens"]
+            session.training_input_ids.extend(input_ids + output_ids)
+            session.training_labels.extend([-100] * len(input_ids) + output_ids)
+            session.training_logprobs.extend([0] * len(input_ids) + result["log_prob"])
+        if release_at_once:
+            await self.release_session(
+                session.session_id, release_cache=False, save_infer_info=request.for_training
+            )  # cache had been released
 
         return {
             "id": str(session.session_id),
@@ -505,6 +530,8 @@ class APIServer:
                 self.server.force_exit = True
                 try:
                     await self.task
+                except asyncio.CancelledError:
+                    pass
                 except Exception as e:  # noqa: BLE001
                     get_logger().error(f"Error while forcing API server shutdown: {e}")
             self.task = None

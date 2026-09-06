@@ -24,9 +24,6 @@ from torch.utils.tensorboard import SummaryWriter
 from alloylm.algorithm.base import Dataset, DatasetConfig, Task, TaskData, TaskItem
 from alloylm.algorithm.rl.utils import get_logger, get_tb_writer
 from alloylm.engine.model import AlloyLMModelConfig
-from alloylm.engine.train_engine.hack_client import (
-    HighConcurrentClient as AsyncClient,
-)
 from alloylm.engine.train_engine.train_engine import RLInput
 from alloylm.engine.train_engine.train_infer_engine import (
     SpmdTrainInferEngine,
@@ -43,12 +40,11 @@ tb_writer = get_tb_writer()
 
 def to_rl_data(task_data: TaskData) -> RLInput:
     rollout_data = task_data.others["rl_data"]
-    return RLInput(
-        input_ids=rollout_data["input_ids"],
-        labels=rollout_data["labels"],
-        inference_logprobs=rollout_data["log_probs"],
+    data = RLInput(
+        messages=task_data.messages,
         advantages=rollout_data["advantages"],
     )
+    return data
 
 
 # config
@@ -576,93 +572,48 @@ class RLAlgorithm:
             self.eval_dataset = []
             self.eval_task = None
 
-    def prepare_fake_data(self):
-        train_batch = []
-        for _ in range(self.args.roll_out_bs * self.args.num_rl_group):
-            seq_len = random.randint(512, 1024)
-            prompt_len = random.randint(100, seq_len // 2)
-            input_ids = [random.randint(0, 1000) for _ in range(seq_len)]
-            labels = [-100] * prompt_len + input_ids[prompt_len:]
-            log_probs = [random.uniform(-5.0, -0.1) for _ in range(seq_len)]
-            advantage = random.uniform(-1.0, 1.0)
-            item = TaskData(
-                id=f"fake_{random.randint(0, 100000)}",
-                messages=[{"role": "user", "content": "fake"}, {"role": "assistant", "content": "fake"}],
-                metric=random.choice([0, 1]),
-                total_tokens=seq_len,
-                finish_reason=random.choice(["stop", "length"]),
-                others={
-                    "rl_data": {
-                        "input_ids": input_ids,
-                        "labels": labels,
-                        "log_probs": log_probs,
-                        "advantages": advantage,
-                    },
-                },
-            )
-            train_batch.append(item)
-        return train_batch
-
     async def step(self, step, url):
-        if os.environ.get("USE_FAKE_DATA", "0") == "1":
-            logger.warning("Using fake data for testing.")
-            train_batch = self.prepare_fake_data()
-            eval_reward = -100000
-        else:
-            # set model url
-            self.global_step = step
-            for dataset in self.datasets + self.eval_dataset:
-                dataset.config.infer_args.model_name = self.args.model_name
-                dataset.config.infer_args.model_url = url
+        # set model url
+        self.global_step = step
+        for dataset in self.datasets + self.eval_dataset:
+            dataset.config.infer_args.model_name = self.args.model_name
+            dataset.config.infer_args.model_url = url
 
-            async def finish_eval():
-                eval_result = await self.eval_handle
-                self.eval_handle = None
-                if eval_result is not None:
-                    _, eval_reward = self.log_data(
-                        functools.reduce(operator.iadd, list(eval_result.values()), []), step, "evalset"
-                    )
-                    self.dump_result(functools.reduce(operator.iadd, list(eval_result.values()), []), step, "evalset")
-                else:
-                    eval_reward = -100000
-                return eval_reward
-
-            # run task
-            if self.eval_task is not None and (
-                (step == 0 and os.environ.get("DISABLE_INIT_EVAL", "0") != "1")
-                or (step + 1) % self.args.eval_interval == 0
-                or step == self.total_steps - 1
-            ):
-                self.eval_handle = asyncio.create_task(self.eval_task.run(self.semaphore))
-                await asyncio.sleep(10)  # allow eval to start first
+        async def finish_eval():
+            eval_result = await self.eval_handle
+            self.eval_handle = None
+            if eval_result is not None:
+                _, eval_reward = self.log_data(
+                    functools.reduce(operator.iadd, list(eval_result.values()), []), step, "evalset"
+                )
+                self.dump_result(functools.reduce(operator.iadd, list(eval_result.values()), []), step, "evalset")
             else:
-                self.eval_handle = asyncio.create_task(asyncio.sleep(0))
-            train_batch, filtered_batch = await self.train_task.run(self.semaphore)
-            eval_reward = await finish_eval()
+                eval_reward = -100000
+            return eval_reward
 
-            # log
-            self.train_task.log_tensorboard(step)
-            self.log_data(train_batch + filtered_batch, step, "trainset")
+        # run task
+        if self.eval_task is not None and (
+            (step == 0 and os.environ.get("DISABLE_INIT_EVAL", "0") != "1")
+            or (step + 1) % self.args.eval_interval == 0
+            or step == self.total_steps - 1
+        ):
+            self.eval_handle = asyncio.create_task(self.eval_task.run(self.semaphore))
+            await asyncio.sleep(10)  # allow eval to start first
+        else:
+            self.eval_handle = asyncio.create_task(asyncio.sleep(0))
+        train_batch, filtered_batch = await self.train_task.run(self.semaphore)
+        eval_reward = await finish_eval()
 
-            # post process
-            for x in train_batch:
-                try:
-                    retrieved = AsyncClient.retrieve_collected_tokens(x.messages)
-                except ValueError:
-                    logger.critical(f"Failed to retrieve tokens for messages: {x.messages}")
-                    retrieved = {}
-                x.others["rl_data"].update(retrieved)
-            train_batch = [x for x in train_batch if "input_ids" in x.others["rl_data"]]
+        # log
+        self.train_task.log_tensorboard(step)
+        self.log_data(train_batch + filtered_batch, step, "trainset")
 
-            if step == 0 or (step + 1) % self.args.eval_interval == 0 or step == self.total_steps - 1:
-                self.dump_result(train_batch + filtered_batch, step, "trainset")
-        if self.args.num_rl_group == 1:  # use batch advantage normalization when num_rl_group == 1.
-            advtanges = torch.tensor([x.others["rl_data"]["advantages"] for x in train_batch])
-            advtanges = (advtanges - advtanges.mean()) / (advtanges.std() + 1e-8)
-            for i in range(len(train_batch)):
-                train_batch[i].others["rl_data"]["advantages"] = advtanges[i].item()
+        # post process
+        if step == 0 or (step + 1) % self.args.eval_interval == 0 or step == self.total_steps - 1:
+            self.dump_result(train_batch + filtered_batch, step, "trainset")
         if self.args.data_post_process_func is not None:
             train_batch = self.args.data_post_process_func(train_batch)
+
         return [to_rl_data(task_data) for task_data in train_batch], eval_reward
 
     async def resume(self, folder):
@@ -799,9 +750,9 @@ class RLTrainer:
 
                 with MeasureTime("stop_server"):
                     self.logger.info("**Algorithm ends, stopping model serving...")
-                    generate_tokens = await self.model_engine.stop_serve()
+                    num_prefill_tokens, num_decoding_tokens, num_release_tokens = await self.model_engine.pause_serve()
                     get_logger().info(
-                        f"**Model serving ends, generated {generate_tokens // 1024} k tokens,throughput: {int(generate_tokens / self.model_engine.config.num_workers / (time.time() - t0))} tokens/s"
+                        f"**Model serving ends, generated {num_prefill_tokens // 1024} k prefill tokens, {num_decoding_tokens // 1024} k decoding tokens, {num_release_tokens // 1024} k release tokens, throughput: {int((num_decoding_tokens) / self.model_engine.config.num_workers / (time.time() - t0))} tokens/s"
                     )
 
                 if len(train_data) != 0:
@@ -836,6 +787,7 @@ class RLTrainer:
             for key, t in timer.summary().items():
                 self.tb_writer.add_scalar(f"Time/{key}", t, step)
             self.logger.info("----------------------------\n\n")
+        await self.model_engine.stop_serve()
 
     async def checkpoint(self, step):
         ckpt_folder = self.config.work_dir + "/checkpoints/"

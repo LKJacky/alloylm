@@ -46,7 +46,11 @@ class UnifiedConfig(BaseModel):
     max_checkpoints: int = 1
     eval_interval: int = 10
     auto_resume: bool = True
+
     # infra
+    chat_template: object = None
+    tool_pattern: str | None = None
+
     work_dir: str = "work_dirs/debug"
     num_workers: int = 1
     max_concurrency_per_node: int = 128
@@ -84,6 +88,8 @@ def create_trainer(
                 model_name=DEFAULT_MODEL_NAME,
                 max_prefill_length=config.max_prefill_length,
                 memory_usage=config.cache_max_entry_count,
+                chat_template=config.chat_template,
+                tool_pattern=config.tool_pattern,
             ),
         ),
         datasets=config.train_datasets,

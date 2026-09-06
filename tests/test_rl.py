@@ -9,51 +9,45 @@ from torch import distributed as dist
 from alloylm.algorithm.base import InferArgs, TaskData
 from alloylm.algorithm.rl.rl_config import UnifiedConfig, create_trainer
 from alloylm.engine.model import AlloyLMModelConfig
-from alloylm.engine.train_engine.train_infer_engine import (
-    AsyncClient as RLAsyncClient,
-)
 from alloylm.engine.train_engine.utils import FSDPConfig
-from alloylm.impl import common
+from alloylm.impl.count_to_n import CountToNDatasetConfig
+from alloylm.impl.engines.qwen.chat_template import QWEN_TOOL_PATTERN, Qwen3ChatTemplate
 from alloylm.impl.engines.qwen.qwen2_modeling2 import FSDPQwen2ForCausalLM
 from alloylm.impl.math import GSM8KDatasetConfig
-from alloylm.test_utils import CudaAsyncTestCase
+from alloylm.test_utils import CudaAsyncTestCase, collect_garbage
+
+train_infer_args = InferArgs(
+    sample_args={
+        "top_p": 1.0,
+        "temperature": 1.0,
+        "max_tokens": 512,
+        "extra_body": {"for_training": True},
+    }
+)
+eval_infer_args = InferArgs(sample_args={"top_p": 1.0, "temperature": 1.0, "max_tokens": 512})
 
 default_config = UnifiedConfig(
     llm_config=AlloyLMModelConfig(
-        path="Qwen/Qwen2.5-0.5B-Instruct",
+        path="Qwen/Qwen3-0.6B",
         model_cls=FSDPQwen2ForCausalLM,
         fsdp_config=FSDPConfig(
             train_mesh={"mesh_shape": (1, 1), "mesh_dim_names": ["dp", "sp"], "device_type": "cuda"},
             infer_mesh={"mesh_shape": (1, 1), "mesh_dim_names": ["dp", "tp"], "device_type": "cuda"},
+            lm_head_dtype=torch.bfloat16,
+            shard_dtype=torch.bfloat16,
         ),
     ),
     max_length_rollout=1024,
     max_length_train=1024,
     # data
     train_datasets=[
-        GSM8KDatasetConfig(
-            name="gsm8k_1",
-            split="train",
-            infer_args=InferArgs(sample_args={"top_p": 1.0, "temperature": 1.0, "max_tokens": 512}),
-        ),
-        GSM8KDatasetConfig(
-            name="gsm8k_2",
-            split="train",
-            infer_args=InferArgs(sample_args={"top_p": 1.0, "temperature": 1.0, "max_tokens": 512}),
-        ),
+        GSM8KDatasetConfig(name="gsm8k_1", split="train", infer_args=train_infer_args),
+        GSM8KDatasetConfig(name="gsm8k_2", split="train", infer_args=train_infer_args),
     ],
     train_sample_ratios=[1.0, 1.0],
     eval_datasets=[
-        GSM8KDatasetConfig(
-            name="gsm8k_1",
-            split="test",
-            infer_args=InferArgs(sample_args={"top_p": 1.0, "temperature": 1.0, "max_tokens": 512}),
-        ),
-        GSM8KDatasetConfig(
-            name="gsm8k_2",
-            split="test",
-            infer_args=InferArgs(sample_args={"top_p": 1.0, "temperature": 1.0, "max_tokens": 512}),
-        ),
+        GSM8KDatasetConfig(name="gsm8k_1", split="test", infer_args=eval_infer_args),
+        GSM8KDatasetConfig(name="gsm8k_2", split="test", infer_args=eval_infer_args),
     ],
     eval_sample_ratios=[0.001, 0.001],
     # rl algo
@@ -75,20 +69,13 @@ default_config = UnifiedConfig(
     cache_max_entry_count=0.2,
     max_prefill_length=1024,
     sp_size=1,
+    chat_template=Qwen3ChatTemplate,
+    tool_pattern=QWEN_TOOL_PATTERN,
 )
 
 
 class RLTest(CudaAsyncTestCase):
     default_config = default_config
-
-    @classmethod
-    def setUpClass(cls):
-        cls._original_async_client = common.AsyncClient
-        common.AsyncClient = RLAsyncClient
-
-    @classmethod
-    def tearDownClass(cls):
-        common.AsyncClient = cls._original_async_client
 
 
 @unittest.skipUnless(os.environ.get("ENABLE_LONG_RUNNING_TESTS", "0") == "1", "Skipping long-runing test")
@@ -122,7 +109,7 @@ class TestRLSystemQuick(RLTest):
         if dist.is_initialized():
             dist.destroy_process_group()
 
-    async def test_rl(self):
+    async def test_simple_rl(self):
         function_used = {"loss_func_used": False, "data_post_process_used": False, "step_data_process_used": False}
 
         def loss_func(
@@ -183,22 +170,37 @@ class TestRLSystemQuick(RLTest):
         resumed = await trainer.resume()
         self.assertTrue(resumed, "Failed to resume from checkpoint")
 
+        del trainer
+        collect_garbage()
+
     async def test_async_rl(self):
         shutil.rmtree("work_dirs/tests/rl", ignore_errors=True)
         config = copy.deepcopy(self.default_config)
         config.work_dir = "work_dirs/tests/rl"
+        config.total_training_steps = 4
+        config.roll_out_bs = 4
         config.async_rollout = "task"
         trainer = create_trainer(config)
         await trainer.lazy_init()
         await trainer.fit()
         del trainer
 
-    async def test_rl_with_fake_data(self):
-        try:
-            os.environ["USE_FAKE_DATA"] = "1"
-            await self.test_rl()
-        finally:
-            os.environ.pop("USE_FAKE_DATA", None)
+    async def test_agentic_async_rl(self):
+        shutil.rmtree("work_dirs/tests/rl", ignore_errors=True)
+        config = copy.deepcopy(self.default_config)
+        config.train_datasets = [CountToNDatasetConfig(max_target=32, infer_args=train_infer_args)]
+        config.train_sample_ratios = [1.0]
+        config.eval_datasets = [CountToNDatasetConfig(max_target=32, infer_args=eval_infer_args)]
+        config.eval_sample_ratios = [0.1]
+        config.work_dir = "work_dirs/tests/rl"
+        config.total_training_steps = 4
+        config.roll_out_bs = 4
+        config.async_rollout = "task"
+        trainer = create_trainer(config)
+        await trainer.lazy_init()
+        await trainer.fit()
+        await trainer.model_engine.shutdown()
+        del trainer
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "Requires at least 2 GPUs")
     async def test_rl_gpu2(self):

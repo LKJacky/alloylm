@@ -53,7 +53,12 @@ class BaseAgent:
         self.messages.extend(messages)
         for _ in range(self.max_steps):
             message = await self.chat(self.messages)
-            self.messages.append(message.model_dump())
+            # build message from assistant
+            message_data = {"role": message.role, "content": message.content}
+            if message.tool_calls:
+                message_data["tool_calls"] = [call.model_dump(exclude_none=True) for call in message.tool_calls]
+            self.messages.append(message_data)
+
             if not message.tool_calls:
                 break
             else:

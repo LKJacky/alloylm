@@ -122,11 +122,16 @@ class RleasedSession:
             self._released_prefill_sessions = []
 
     def _iterative_release(self):
+        def _release_session(session: DeviceSession):
+            assert session.on_device(), "Session is not on device, cannot release"
+            num_released_tokens = len(session.forwarded_tokens)
+            self.cache.reset([session])
+            return num_released_tokens
+
         if self.free_queue is not None:
             for session in self.free_queue.values():
                 if session.on_device():
-                    self.cache.reset([session])
-                    yield session, 1
+                    yield session, _release_session(session)
 
         if self.prefill_queue is not None:
             self._released_prefill_sessions = []
@@ -134,8 +139,7 @@ class RleasedSession:
                 session = self.prefill_queue.pop()
                 self._released_prefill_sessions.append(session)
                 if session.device_session.on_device():
-                    self.cache.reset([session.device_session])
-                    yield session, 1
+                    yield session, _release_session(session.device_session)
         if self.prefill_queue is not None:
             self.prefill_queue.update(self._released_prefill_sessions)
             self._released_prefill_sessions = []
@@ -145,8 +149,7 @@ class RleasedSession:
                 session = self.decode_queue.pop()
                 self.prefill_queue.add(session)
                 if session.device_session.on_device():
-                    self.cache.reset([session.device_session])
-                    yield session, 1
+                    yield session, _release_session(session.device_session)
 
 
 class SchedulerServer:
@@ -155,7 +158,7 @@ class SchedulerServer:
         model: AlloyLMModel,
         cache: Cache,
         max_prefill_length: int,
-        task_queue: Queue[GeneConfig] = Queue(),
+        task_queue: Queue[GeneConfig],
         real_vocab_size=-1,
     ):
         self.model = model
@@ -179,6 +182,9 @@ class SchedulerServer:
 
         self.top_cache_usage_for_decode = 0.9
         self.bottom_cache_usage_for_decode = 0.7
+
+        self.num_prefill_tokens = 0
+        self.num_decode_tokens = 0
 
     def apply_device_session(self, infer_item: InferItem):
         assert infer_item.device_session is None, "Device session already set for this infer item"
@@ -222,29 +228,10 @@ class SchedulerServer:
                     self.cache.reset([exist_session])
                 await self.finish_item(session, None)
             elif isinstance(session, ReleaseItem):
-                num = (
-                    len(self.decode_queue)
-                    + len(self.prefill_queue)
-                    + len(self.device_sessions)
-                    + self.wait_queue.qsize()
-                )
-                while len(self.decode_queue) > 0:
-                    seq = self.decode_queue.pop()
-                    await self.finish_item(seq, seq, reason="abort")
-                while len(self.prefill_queue) > 0:
-                    seq = self.prefill_queue.pop()
-                    await self.finish_item(seq, seq, reason="abort")
-                while len(self.device_sessions) > 0:
-                    _, _session = self.device_sessions.popitem()
-                    self.cache.reset([_session])
-                while self.wait_queue.empty() is False:
-                    _session = await self.wait_queue.get()
-                    await self.finish_item(_session, _session, reason="abort")
-                if num != 0:
-                    get_logger().info(f"Release all {num} tasks in scheduler")
-                await self.finish_item(session, None)
+                return True
             else:
-                raise ValueError(f"Unknown item type in wait_queue: {type(session)}")
+                raise TypeError(f"Unknown item type in wait_queue: {type(session)}")
+        return False
 
     @torch.inference_mode()
     def update_with_logits(self, sessions: list[InferItem], batch_logits):
@@ -306,8 +293,8 @@ class SchedulerServer:
                         else:
                             enough_memory = False
                             if len(self.decode_queue) + len(chunk_sessions) == 0:
-                                for release_session, _num_release in release_iter:
-                                    num_release += _num_release
+                                for _, _ in release_iter:
+                                    num_release += 1
                                     if self.cache.allocate_cache(session.device_session):
                                         enough_memory = True
                                         break
@@ -359,8 +346,8 @@ class SchedulerServer:
                 if self.cache.allocate_cache(session.device_session):
                     allocate = True
                 else:
-                    for _, release_num in release_iter:
-                        num_reset_sessions += release_num
+                    for _, _ in release_iter:
+                        num_reset_sessions += 1
                         if self.cache.allocate_cache(session.device_session):
                             allocate = True
                             break
@@ -417,56 +404,49 @@ class SchedulerServer:
 
         while True:
             try:
-                release = await self.update_queue()
-                if release:
-                    num = len(self.decode_queue) + len(self.prefill_queue)
-                    while len(self.decode_queue) > 0:
-                        seq = self.decode_queue.pop()
-                        await self.finish_item(seq, seq, reason="abort")
-                    while len(self.prefill_queue) > 0:
-                        seq = self.prefill_queue.pop()
-                        await self.finish_item(seq, seq, reason="abort")
-                    get_logger().info(f"Release all {num} tasks in scheduler")
-                    await self.finish_item(release, None)
-                    return "sleep", 0.1, 0
-                else:
-                    # try prefill
-                    if (
-                        self.cache.cache_usage([x.device_session for x in self.decode_queue])
-                        < self.bottom_cache_usage_for_decode
-                    ):
-                        status_before_prefill = get_engine_status()
-                        t0 = time.time()
-                        num_prefill_sessions, num_prefill_tokens = await self.prefill()
-                        if num_prefill_sessions > 0:
-                            log_decode(decode_status, status_before_prefill)
-                            get_logger().debug(
-                                f"Prefill:\tbatch: {num_prefill_sessions},\ttokens:\t{num_prefill_tokens}\tThroughput: {int(num_prefill_tokens / (max(time.time() - t0, 1e-5))):>5} tokens/s\t"
-                                + get_engine_status()
-                            )
+                is_release = await self.update_queue()
+                if is_release:
+                    break
+                # try prefill
+                if (
+                    self.cache.cache_usage([x.device_session for x in self.decode_queue])
+                    < self.bottom_cache_usage_for_decode
+                ):
+                    status_before_prefill = get_engine_status()
+                    t0 = time.time()
+                    num_prefill_sessions, num_prefill_tokens = await self.prefill()
+                    if num_prefill_sessions > 0:
+                        log_decode(decode_status, status_before_prefill)
+                        get_logger().debug(
+                            f"Prefill:\tbatch: {num_prefill_sessions},\ttokens:\t{num_prefill_tokens}\tThroughput: {int(num_prefill_tokens / (max(time.time() - t0, 1e-5))):>5} tokens/s\t"
+                            + get_engine_status()
+                        )
+                    self.num_prefill_tokens += num_prefill_tokens
 
-                    # try decode
-                    decode_sessions, num_finish = await self.decode()
+                # try decode
+                decode_sessions, num_finish = await self.decode()
+                self.num_decode_tokens += len(decode_sessions)
 
-                    if decode_status["batch"] != len(decode_sessions) or (decode_status["step"] + 1) % 1024 == 0:
-                        log_decode(decode_status)
-                        decode_status["batch"] = len(decode_sessions)
-                    if len(decode_sessions) > 0:
-                        decode_status["step"] += 1
+                if decode_status["batch"] != len(decode_sessions) or (decode_status["step"] + 1) % 1024 == 0:
+                    log_decode(decode_status)
+                    decode_status["batch"] = len(decode_sessions)
+                if len(decode_sessions) > 0:
+                    decode_status["step"] += 1
 
-                    if (
-                        (decode_status["step"] + 1) % 16 == 0
-                        or num_finish > 0
-                        or len(self.decode_queue) < self.cache.max_infer_batch_size
-                    ):
-                        await asyncio.sleep(0)  # yield to server for finishing tasks
+                if (
+                    (decode_status["step"] + 1) % 16 == 0
+                    or num_finish > 0
+                    or len(self.decode_queue) < self.cache.max_infer_batch_size
+                ):
+                    await asyncio.sleep(0)  # yield to server for finishing tasks
 
             except Exception as e:
                 get_logger().error(f"Scheduler server encountered an error: {e}")
                 print("Full traceback:", traceback.format_exc())
-                raise e
+                raise
 
     async def launch(self):
+        self.num_decode_tokens, self.num_prefill_tokens = 0, 0
         loop = asyncio.get_event_loop()
         self.cache.prepare()
         self.max_infer_length = self.cache.max_infer_length
@@ -475,7 +455,21 @@ class SchedulerServer:
         self.task = task
         get_logger().info("launch scheduler successfully")
 
-    async def stop_server(self):
+    async def pause(self):
+        await self.wait_queue.put(ReleaseItem(-1))
+        await self.task
+        with RleasedSession(self.device_sessions, self.prefill_queue, self.decode_queue, self.cache) as release_iter:
+            num_release = 0
+            num_released_tokens = 0
+            for _, num_relased_tokens in release_iter:
+                num_released_tokens += num_relased_tokens
+                num_release += 1
+        get_logger().info(f"Released {num_release} sessions, {num_released_tokens} tokens")
+        await self.stop_server(finish_session=False)
+        token_info = (self.num_prefill_tokens, self.num_decode_tokens, num_released_tokens)
+        return token_info
+
+    async def stop_server(self, finish_session=True):
         if self.task is not None:
             task = self.task
             self.task = None
@@ -486,7 +480,17 @@ class SchedulerServer:
                 pass
             finally:
                 self.cache.close()
-                get_logger().info("Scheduler server stopped successfully")
+        if finish_session:
+            while len(self.prefill_queue) > 0:
+                session = self.prefill_queue.pop(0)
+                await self.finish_item(session, session, reason="abort")
+            while len(self.decode_queue) > 0:
+                session = self.decode_queue.pop(0)
+                await self.finish_item(session, session, reason="abort")
+            while self.wait_queue.qsize() > 0:
+                session = self.wait_queue.get_nowait()
+                await self.finish_item(session, session, reason="abort")
+        get_logger().info("Scheduler server stopped successfully")
 
     async def finish_item(self, item: TaskItem, result, reason="stop"):
         if isinstance(item, InferItem):

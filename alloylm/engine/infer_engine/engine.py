@@ -100,9 +100,6 @@ class InferEngine:
         self.paused = False
 
     async def launch(self):
-        queue = Queue()  # create a new queue for each launch to avoid interference from previous runs
-        self.scheduler_server.wait_queue = queue
-        self.api_server.queue = queue
         await asyncio.get_event_loop().run_in_executor(None, dist.barrier)
         await self.scheduler_server.launch()
         if not self.paused:
@@ -113,16 +110,16 @@ class InferEngine:
         self.paused = False
 
     async def stop(self):
-        if not self.paused:
-            await self.scheduler_server.stop_server()
         await self.api_server.stop_server()
+        await self.scheduler_server.stop_server()
         if self.proxy_server:
             await self.proxy_server.stop_server()
         self.scheduler_server.model.train_shard()
 
     async def pause(self):
-        await self.scheduler_server.stop_server()
+        infer_tokens = await self.scheduler_server.pause()
         self.paused = True
+        return infer_tokens
 
     @contextmanager
     def gather(self):
@@ -141,6 +138,11 @@ class InferEngine:
 
     async def wait_closed(self):
         await self.api_server.wait_closed()
+
+    def fetch_infer_info(self):
+        cached_infer_info = self.api_server.cached_infer_info.copy()
+        self.api_server.cached_infer_info.clear()
+        return cached_infer_info
 
 
 class SPMDInferConfig(PydanticBaseModel):

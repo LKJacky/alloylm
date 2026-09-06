@@ -6,12 +6,13 @@ import tempfile
 import unittest
 
 import torch
+from openai import AsyncClient
 
 from alloylm.engine.infer_engine.engine import InferEngineConfig
 from alloylm.engine.model import AlloyLMModelConfig
 from alloylm.engine.train_engine.train_engine import TrainEngineConfig
 from alloylm.engine.train_engine.train_infer_engine import (
-    AsyncClient,
+    RLInput,
     SpmdTrainInferEngine,
     TrainInferEngineConfig,
 )
@@ -28,7 +29,6 @@ class TrainInferEngineTest(CudaAsyncTestCase):
         work_dir = tempfile.mkdtemp()
         engine = None
         client = None
-        serving = False
 
         try:
             fsdp_config = FSDPConfig(
@@ -71,7 +71,6 @@ class TrainInferEngineTest(CudaAsyncTestCase):
             # long generations, and repeated infer/train transitions.
             for step in range(4):
                 await engine.serve()
-                serving = True
                 client = AsyncClient(api_key="EMPTY", base_url=await engine.get_server_ip())
                 prompts = [
                     [
@@ -89,33 +88,27 @@ class TrainInferEngineTest(CudaAsyncTestCase):
                             max_completion_tokens=512,
                             temperature=1.0,
                             top_p=1.0,
+                            extra_body={"for_training": True},
                         )
                         for prompt in prompts
                     )
                 )
                 self.assertTrue(all(response.usage.completion_tokens > 0 for response in responses))
 
-                rollouts = []
-                for prompt, response in zip(prompts, responses):
+                train_batch = []
+                for index, (prompt, response) in enumerate(zip(prompts, responses)):
                     messages = prompt + [{"role": "assistant", "content": response.choices[0].message.content}]
-                    rollouts.append(AsyncClient.retrieve_collected_tokens(messages))
+                    train_batch.append(
+                        RLInput(
+                            messages=messages,
+                            advantages=-1.0 if index % 8 < 4 else 1.0,
+                        )
+                    )
                 await client.close()
                 client = None
-                await engine.stop_serve()
-                serving = False
+                await engine.pause_serve()
 
-                result = await engine.train(
-                    [
-                        {
-                            "input_ids": rollout["input_ids"],
-                            "labels": rollout["labels"],
-                            "inference_logprobs": rollout["log_probs"],
-                            "advantages": -1.0 if index % 8 < 4 else 1.0,
-                        }
-                        for index, rollout in enumerate(rollouts)
-                    ],
-                    step=step,
-                )
+                result = await engine.train_wrapper(train_batch, step)
 
                 completion_tokens = sum(response.usage.completion_tokens for response in responses)
                 self.assertEqual(result["logprob_diff/num_tokens"], completion_tokens)
@@ -123,12 +116,10 @@ class TrainInferEngineTest(CudaAsyncTestCase):
         finally:
             if client is not None:
                 await client.close()
-            if serving and engine is not None:
+            if engine is not None:
                 await engine.stop_serve()
-            if engine is not None and hasattr(engine, "actor"):
-                engine.actor.shutdown()
-                del engine.actor
-            del engine
+                await engine.shutdown()
+                del engine
             gc.collect()
             torch.cuda.empty_cache()
             shutil.rmtree(work_dir, ignore_errors=True)

@@ -3,9 +3,9 @@ import os
 
 import orjson
 import requests
+from openai import AsyncClient
 
 from alloylm.algorithm.base import Dataset, DatasetConfig, Task, TaskData, TaskItem
-from alloylm.server.client import HighConcurrentClient as AsyncClient
 
 
 def load_jsonl(file_path: str):

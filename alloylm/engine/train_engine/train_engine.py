@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 from typing import Any, TypedDict
 
+import ray
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn.functional as F
@@ -53,10 +54,9 @@ logger = get_logger()
 
 
 class RLInput(TypedDict, total=False):
-    input_ids: list[int]
-    labels: list[int]
-    inference_logprobs: list[float]
+    messages: list[dict]
     advantages: float
+    infer_info: ray.ObjectRef
 
 
 # loss
@@ -350,6 +350,7 @@ class TrainEngine:
     # training step
 
     def step(self, batch: list[dict[str, Any]], step):  # step rl
+
         dataset = TaskDataset(batch)
         pack_dataset = SoftPackDataset([dataset], target=self.config.max_length)
         dataloader = DataLoader(
