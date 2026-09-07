@@ -213,7 +213,7 @@ class SFTTrainer:
                 # gc.collect()
                 # torch.cuda.empty_cache()
 
-                if (step + 1) % self.config.checkpoint_interval == 0:
+                if (step + 1) % self.config.checkpoint_interval == 0 or step == self.config.total_training_steps - 1:
                     with MeasureTime("ckpt_time"):
                         await self.checkpoint(step)
 
