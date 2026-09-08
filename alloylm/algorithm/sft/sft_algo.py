@@ -224,7 +224,7 @@ class SFTTrainer:
             global_tokens = train_log["num_tokens"] / self.sp_size
             train_log["tgs"] = int(global_tokens / train_time / self.dp_size / self.sp_size)
 
-            log_str = ", ".join(f"{k}: {v:.4f}" for k, v in train_log.items())
+            log_str = ", ".join(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in train_log.items())
             self.logger.info(f"**SFT training step {step} logs: {log_str}")
             for k, v in train_log.items():
                 self.tb_writer.add_scalar(f"sft/{k}", v, step)
