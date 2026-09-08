@@ -425,7 +425,7 @@ class TrainEngine:
         total_tokens = total_tokens.item()
         if total_tokens == 0:
             get_logger().warning("No supervised tokens in this step, skipping.")
-            return {"loss": 0.0, "grad_norm": 0.0, "num_tokens": 0}
+            return {"loss": 0.0, "grad_norm": 0.0, "num_tokens": 0, "tgs": 0}
 
         step_t0 = time.time()
         step_loss = 0.0
@@ -464,19 +464,27 @@ class TrainEngine:
         reduced_loss = torch.tensor(step_loss, device="cuda")
         dist.all_reduce(reduced_loss, op=dist.ReduceOp.AVG)
         step_time = time.time() - step_t0
+        global_tokens = total_tokens / self.config.sp_size
+        tgs = int(global_tokens / step_time / self.dp_size / self.config.sp_size)
 
         get_logger().info(
             f"[SFT] Step {self.train_state.cur_step}/{self.total_steps}  "
             f"loss: {reduced_loss.item():.4f}  "
             f"grad_norm: {grad_norm:.2f}  "
             f"lr: {self.cosine_scheduler.get_last_lr()[0]:.6f}  "
+            f"tgs: {tgs}  "
             f"tokens: {int(total_tokens)}  "
             f"time: {step_time:.2f}s  "
             f"Mem: {torch.cuda.max_memory_allocated() / 1024**3:.1f} G"
         )
 
         self.train_state.step()
-        return {"loss": reduced_loss.item(), "grad_norm": grad_norm.item(), "num_tokens": int(total_tokens)}
+        return {
+            "loss": reduced_loss.item(),
+            "grad_norm": grad_norm.item(),
+            "num_tokens": int(total_tokens),
+            "tgs": tgs,
+        }
 
     @torch.no_grad()
     def _log_logprob_diff(self, tasks: list[dict[str, Any]]):

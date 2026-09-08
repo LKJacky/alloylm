@@ -107,6 +107,7 @@ class SFTTrainer:
         )
         self.chat_template = ChatTemplate(self.tokenizer)
         self.dp_size = config.llm_config.fsdp_config.train_mesh["mesh_shape"][0]
+        self.sp_size = config.engine_config.train_config.sp_size
 
         # Populated by lazy_init / advanced by fit.
         self.jsonl_paths: list[str] = []
@@ -217,7 +218,14 @@ class SFTTrainer:
                     with MeasureTime("ckpt_time"):
                         await self.checkpoint(step)
 
-            # log
+            # total_tokens is reduced across all ranks and therefore duplicated
+            # across sequence-parallel ranks. Report throughput per GPU.
+            train_time = timer.summary()["step_time.train_time"]
+            global_tokens = train_log["num_tokens"] / self.sp_size
+            train_log["tgs"] = int(global_tokens / train_time / self.dp_size / self.sp_size)
+
+            log_str = ", ".join(f"{k}: {v:.4f}" for k, v in train_log.items())
+            self.logger.info(f"**SFT training step {step} logs: {log_str}")
             for k, v in train_log.items():
                 self.tb_writer.add_scalar(f"sft/{k}", v, step)
             self.tb_writer.add_scalar("sft/epoch", epoch, step)
