@@ -17,12 +17,18 @@ from alloylm.algorithm.sft.sft_algo import SFTAlgorithmConfig, SFTTrainer
 from alloylm.engine.infer_engine.engine import InferEngineConfig
 from alloylm.engine.model import AlloyLMModelConfig
 from alloylm.engine.spmd import init_dist
-from alloylm.engine.train_engine.dataset import SFTData, SFTDataset, sft_collate_fn
+from alloylm.engine.train_engine.dataset import (
+    SFTData,
+    SFTDataset,
+    sft_collate_fn,
+    tokenize_messages,
+)
 from alloylm.engine.train_engine.train_engine import TrainEngine, TrainEngineConfig
 from alloylm.engine.train_engine.train_infer_engine import TrainInferEngineConfig
 from alloylm.engine.train_engine.utils import FSDPConfig
 from alloylm.impl.engines.qwen.qwen2_modeling2 import FSDPQwen2ForCausalLM
 from alloylm.test_utils import CudaAsyncTestCase
+from alloylm.utils import get_chat_template_from_tokenizer
 
 MODEL_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
 NUM_SFT_STEPS = 12
@@ -177,39 +183,6 @@ class SftCollateFnTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class QwenChatTemplate:
-    """Callable wrapping ``tokenizer.apply_chat_template`` to the signature
-    ``SFTDataset`` expects: ``(messages, add_generation_prompt=False) -> str``.
-
-    A plain instance (not a function) is used on purpose: assigning a bare
-    function to a ``unittest`` class attribute turns ``self.chat_template`` into a
-    bound method whose ``self`` would leak into the call and shift the arguments.
-    """
-
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-
-    def __call__(self, messages, add_generation_prompt=False):
-        return self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=add_generation_prompt, tokenize=False
-        )
-
-
-def _sft_token_count(tokenizer, chat_template, messages):
-    """Mirror ``SFTDataset.distangle_train_or_not_train`` + ``tokenize`` to
-    compute the token count a given conversation will produce (must match
-    ``SFTData.num_tokens``)."""
-    converted = []
-    pre_text = ""
-    for i, msg in enumerate(messages):
-        add_gen = (i + 1 < len(messages)) and messages[i + 1]["role"] == "assistant"
-        text = chat_template(messages[: i + 1], add_generation_prompt=add_gen)
-        has_loss = msg["role"] == "assistant"
-        converted.append((text[len(pre_text) :], has_loss))
-        pre_text = text
-    return sum(len(tokenizer.encode(t, add_special_tokens=False)) for t, _ in converted)
-
-
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class SFTTrainEndToEndTest(unittest.TestCase):
     """Runs a full SFT training loop: SFTDataset -> sft_collate_fn -> forward ->
@@ -253,8 +226,8 @@ class SFTTrainEndToEndTest(unittest.TestCase):
         with open(cls.jsonl_path, "w", encoding="utf-8") as f:
             f.write(json.dumps({"messages": cls.conversation}, ensure_ascii=False) + "\n")
 
-        cls.chat_template = QwenChatTemplate(cls.tokenizer)
-        num_tokens = _sft_token_count(cls.tokenizer, cls.chat_template, cls.conversation)
+        cls.chat_template = get_chat_template_from_tokenizer(cls.tokenizer)
+        num_tokens = len(tokenize_messages(cls.conversation, cls.chat_template, cls.tokenizer)[0])
         cls.sft_data = [SFTData(jsonl_idx=[0], offsets=[0], num_tokens=[num_tokens]) for _ in range(NUM_SFT_STEPS)]
 
     @classmethod

@@ -21,28 +21,7 @@ from alloylm.engine.train_engine.train_infer_engine import (
     SpmdTrainInferEngine,
     TrainInferEngineConfig,
 )
-
-
-class ChatTemplate:
-    """Callable wrapping ``tokenizer.apply_chat_template`` to the signature the
-    SFT data path expects: ``(messages, add_generation_prompt=False) -> str``.
-
-    The same instance is used both while packing (``sft_tokenize`` /
-    ``analyze_jsonl_file`` on the driver) and by the engine's ``SFTDataset``
-    (via ``set_sft_data`` on the workers), so the ``num_tokens`` computed while
-    packing match what the engine recomputes and its
-    ``assert num_token == len(input_id)`` holds. A plain instance (not a bound
-    function) is used so it survives being pickled to the Ray actors.
-    """
-
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-
-    def __call__(self, messages, add_generation_prompt=False):
-        return self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=add_generation_prompt, tokenize=False
-        )
-
+from alloylm.utils import get_chat_template_from_tokenizer
 
 # config
 
@@ -51,6 +30,8 @@ class SFTAlgorithmConfig(BaseModel):
     # model and engine
     llm_config: AlloyLMModelConfig
     engine_config: TrainInferEngineConfig
+    tokenizer: object | None = None
+    chat_template: object | None = None
 
     # Dataset configuration
     datasets: list[SFTPackDatasetConfig | Any] = []
@@ -69,11 +50,22 @@ class SFTAlgorithmConfig(BaseModel):
     work_dir: str = "./work_dirs/"
 
     def model_post_init(self, context):
+        # batch size
         dp_size = self.llm_config.fsdp_config.train_mesh["mesh_shape"][0]
         assert self.global_batch_size % dp_size == 0, (
             f"global_batch_size={self.global_batch_size} must be divisible by dp_size={dp_size}"
         )
         self.micro_batch_size = self.global_batch_size // dp_size
+        # tokenier and chat template
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.llm_config.tokenizer_path or self.llm_config.path,
+                use_fast=True,
+                trust_remote_code=True,
+            )
+        if self.chat_template is None:
+            self.chat_template = get_chat_template_from_tokenizer(self.tokenizer)
+
         return super().model_post_init(context)
 
 
@@ -97,14 +89,8 @@ class SFTTrainer:
 
         # Data path: a tokenizer + chat template shared by packing (driver) and
         # the engine's SFTDataset (workers), so num_tokens agree on both sides.
-        tokenizer_path = config.llm_config.tokenizer_path or config.llm_config.path
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path,
-            use_fast=True,
-            padding_side="right",
-            trust_remote_code=True,
-        )
-        self.chat_template = ChatTemplate(self.tokenizer)
+        self.tokenizer = config.tokenizer
+        self.chat_template = config.chat_template
         self.dp_size = config.llm_config.fsdp_config.train_mesh["mesh_shape"][0]
         self.sp_size = config.engine_config.train_config.sp_size
 
@@ -145,9 +131,8 @@ class SFTTrainer:
         self.packs = []
         num_skip = 0
         for cfg in self.config.datasets:
-            cfg.chat_template = self.chat_template
             cfg.max_length = self.config.max_length
-            dataset = await cfg.build(self.tokenizer)
+            dataset = await cfg.build(self.tokenizer, self.chat_template)
             num_skip += dataset.num_skip_data
             base = len(self.jsonl_paths)
             self.jsonl_paths.extend(dataset.file_paths)

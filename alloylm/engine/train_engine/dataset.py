@@ -12,6 +12,43 @@ from torch.utils.data import ConcatDataset, Dataset
 from transformers import AutoTokenizer
 
 
+def tokenize_messages(messages, chat_template, tokenizer):
+
+    def distangle_train_or_not_train(messages: list[dict], chat_template):
+        # distinguish between has loss or not.
+        converted_messages = []
+        pre_text = ""
+        render = chat_template.render if hasattr(chat_template, "render") else chat_template
+        for i, message in enumerate(messages):
+            if i + 1 < len(messages) and messages[i + 1]["role"] == "assistant":
+                add_generation_prompt = True
+            else:
+                add_generation_prompt = False
+            text = render(messages=messages[: i + 1], add_generation_prompt=add_generation_prompt)
+            if message["role"] == "assistant":
+                has_loss = True
+            else:
+                has_loss = False
+            converted_messages.append((text[len(pre_text) :], has_loss))  # Append only the new part of the text
+            pre_text = text
+        return converted_messages
+
+    def tokenize(converted_messages: list[(str, bool)], tokenizer):
+        input_ids = []
+        labels = []
+        for text, has_loss in converted_messages:
+            tokenized = tokenizer.encode(text, add_special_tokens=False)
+            input_ids.extend(tokenized)
+            if has_loss:
+                labels.extend(tokenized)
+            else:
+                labels.extend([-100] * len(tokenized))  # Mask out tokens that don't contribute to loss
+        return input_ids, labels
+
+    converted_messages = distangle_train_or_not_train(messages, chat_template)
+    return tokenize(converted_messages, tokenizer)
+
+
 # task datasets
 class SoftPackDataset(torch.utils.data.Dataset):
     def __init__(self, datasets, target=2048, blend=False, sort=False):
@@ -202,7 +239,7 @@ class SFTDataset(Dataset):
             file_handle.seek(offset)
             line = file_handle.readline()
             data = json.loads(line)
-            input_id, label = self.tokenize(self.distangle_train_or_not_train(data["messages"]))
+            input_id, label = tokenize_messages(data["messages"], self.chat_template, self.tokenizer)
             input_ids.extend(input_id)
             labels.extend(label)
             seq_lens.append(len(input_id))
@@ -213,35 +250,3 @@ class SFTDataset(Dataset):
             "labels": labels,
             "seq_lens": seq_lens,
         }
-
-    def distangle_train_or_not_train(self, messages: list[dict]):
-        # distinguish between has loss or not.
-        converted_messages = []
-        pre_text = ""
-        for i, message in enumerate(messages):
-            if i + 1 < len(messages) and messages[i + 1]["role"] == "assistant":
-                add_generation_prompt = True
-            else:
-                add_generation_prompt = False
-            text = self.chat_template(
-                messages[: i + 1], add_generation_prompt=add_generation_prompt
-            )  # Convert messages to text using the chat template
-            if message["role"] == "assistant":
-                has_loss = True
-            else:
-                has_loss = False
-            converted_messages.append((text[len(pre_text) :], has_loss))  # Append only the new part of the text
-            pre_text = text
-        return converted_messages
-
-    def tokenize(self, converted_messages: list[(str, bool)]):
-        input_ids = []
-        labels = []
-        for text, has_loss in converted_messages:
-            tokenized = self.tokenizer.encode(text, add_special_tokens=False)
-            input_ids.extend(tokenized)
-            if has_loss:
-                labels.extend(tokenized)
-            else:
-                labels.extend([-100] * len(tokenized))  # Mask out tokens that don't contribute to loss
-        return input_ids, labels

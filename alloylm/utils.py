@@ -102,3 +102,31 @@ def get_free_port(forbid_port=()):
                     return port
         except OSError:
             continue  # If the port is not available, try again
+
+
+# for tokenizer
+
+
+def get_chat_template_from_tokenizer(tokenizer):
+
+    class ChatTemplate:
+        """Callable wrapping ``tokenizer.apply_chat_template`` to the signature the
+        SFT data path expects: ``(messages, add_generation_prompt=False) -> str``.
+
+        The same instance is used both while packing (``sft_tokenize`` /
+        ``analyze_jsonl_file`` on the driver) and by the engine's ``SFTDataset``
+        (via ``set_sft_data`` on the workers), so the ``num_tokens`` computed while
+        packing match what the engine recomputes and its
+        ``assert num_token == len(input_id)`` holds. A plain instance (not a bound
+        function) is used so it survives being pickled to the Ray actors.
+        """
+
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+        def render(self, messages, add_generation_prompt=False, **kwargs):
+            return self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=add_generation_prompt, tokenize=False
+            )
+
+    return ChatTemplate(tokenizer)

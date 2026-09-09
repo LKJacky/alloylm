@@ -5,7 +5,7 @@ import time
 from transformers import AutoTokenizer
 
 from alloylm.algorithm.sft.dataset import SFTPackDatasetConfig
-from alloylm.algorithm.sft.sft_algo import ChatTemplate
+from alloylm.utils import get_chat_template_from_tokenizer
 
 
 async def main():
@@ -19,11 +19,11 @@ async def main():
         file_paths=[args.folder],
         sample_ratios=[1.0],
         max_length=64 * 1024,
-        chat_template=ChatTemplate(tokenizer),
         num_tokenize_workers=args.num_workers,
     )
+    chat_template = get_chat_template_from_tokenizer(tokenizer)
     t0 = time.time()
-    dataset = await config.build(tokenizer)
+    dataset = await config.build(tokenizer, chat_template)
     print(len(dataset))
     t1 = time.time()
     print(f"Tokenization speed: {t1 - t0} seconds")

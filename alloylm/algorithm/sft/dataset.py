@@ -1,7 +1,6 @@
 import asyncio
 import os
 import random
-from collections.abc import Callable
 
 import orjson
 import ray
@@ -9,38 +8,19 @@ import tqdm
 from pydantic import BaseModel
 from torch.utils.data import Dataset
 
+from alloylm.engine.train_engine.dataset import tokenize_messages
 from alloylm.utils import get_logger
 
 logger = get_logger()
-
-
-def count_sft_sample(messages, tokenizer, chat_template):
-    """Tokenize a conversation exactly as the training engine's ``SFTDataset``
-    does.
-
-    Mirrors ``SFTDataset.distangle_train_or_not_train`` + ``tokenize`` in
-    ``alloylm/engine/train_engine/dataset.py``: the chat template is applied
-    incrementally and each new segment is encoded with
-    ``add_special_tokens=False``. Using this length for a pack's ``num_tokens``
-    guarantees the engine's ``assert num_token == len(input_id)`` holds (a whole
-    conversation encoded in one call does not match, because of segment
-    boundaries and implicit special tokens).
-    """
-    num_tokens = 0
-    pre_text = ""
-    for i in range(len(messages)):
-        add_gen = (i + 1 < len(messages)) and messages[i + 1]["role"] == "assistant"
-        text = chat_template(messages[: i + 1], add_generation_prompt=add_gen)
-        toks = tokenizer.encode(text[len(pre_text) :], add_special_tokens=False)
-        pre_text = text
-        num_tokens += len(toks)
-    return num_tokens
 
 
 class SFTPackDataset(Dataset):
     def __init__(
         self, file_paths, sample_ratios, tokenizer, chat_template, max_length, random_seed=42, num_tokenize_workers=-1
     ):
+        if num_tokenize_workers < 1 and num_tokenize_workers != -1:
+            raise ValueError("num_tokenize_workers must be -1 or a positive integer")
+
         self.file_paths, self.sample_ratios = self.get_files_from_folder(file_paths, sample_ratios)
 
         self.tokenizer = tokenizer
@@ -198,7 +178,7 @@ class SFTPackDataset(Dataset):
                 file_handle.seek(offset)
                 line = file_handle.readline()
                 messages = orjson.loads(line)["messages"]
-                num_tokens = count_sft_sample(messages, tokenizer, chat_template)
+                num_tokens = len(tokenize_messages(messages, chat_template, tokenizer)[0])
                 results.append((file_index, offset, num_tokens))
                 if bar:
                     bar.update(1)
@@ -212,15 +192,14 @@ class SFTPackDatasetConfig(BaseModel):
     file_paths: list[str]
     sample_ratios: list[float]
     max_length: int
-    chat_template: Callable[..., str] | None = None
     num_tokenize_workers: int = -1
 
-    async def build(self, tokenizer) -> SFTPackDataset:
+    async def build(self, tokenizer, chat_template) -> SFTPackDataset:
         dataset = SFTPackDataset(
             self.file_paths,
             self.sample_ratios,
             tokenizer,
-            self.chat_template,
+            chat_template,
             self.max_length,
             num_tokenize_workers=self.num_tokenize_workers,
         )
