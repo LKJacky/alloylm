@@ -1,7 +1,6 @@
 import gc
 import math
 import os
-import sys
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -48,9 +47,7 @@ from .dataset import (
     sft_collate_fn,
     task_collate_fn,
 )
-from .utils import clip_grad_norm_, profile_time_and_memory
-
-logger = get_logger()
+from .utils import clip_grad_norm_, engine_logger_name, profile_time_and_memory
 
 
 class RLInput(TypedDict, total=False):
@@ -166,22 +163,6 @@ def split_for_sp(shifted_labels, sequence_parallel_mesh, pad_value=-100):
     return _labels
 
 
-# logger
-
-
-def log_format(rank, debug=False):
-    formatter = f"[AlloyLM][RANK {rank}]"
-    formatter += "[{time:YYYY-MM-DD HH:mm:ss}][<level>{level}</level>]"
-
-    if debug:
-        formatter += "[<cyan>{name}</cyan>:"
-        formatter += "<cyan>{function}</cyan>:"
-        formatter += "<cyan>{line}</cyan>]"
-
-    formatter += " <level>{message}</level>"
-    return formatter
-
-
 # state
 
 
@@ -271,15 +252,12 @@ class TrainEngine:
         init_dist()
         self.rank = dist.get_rank()
         self.gloo_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=60))
-        get_logger().info(f"init rank: {self.rank}")
+        self.logger = get_logger(
+            engine_logger_name(), path=os.path.join(self.config.work_dir, f"engine_rank{self.rank}.log")
+        )
+        self.logger.info(f"init rank: {self.rank}")
+        self.logger.info(self.config)
 
-        # prepare workdir and logger
-        mkdir_or_exist(self.config.work_dir)
-        log_file = os.path.join(self.config.work_dir, f"rank{self.rank}.log")
-        get_logger().remove()
-        get_logger().add(sys.stderr, level="INFO", format=log_format(self.rank, False))
-        get_logger().add(log_file, format=log_format(self.rank), backtrace=True, catch=True, level="DEBUG")
-        get_logger().info(self.config)
         if self.rank == 0:
             self.tb_writer = SummaryWriter(log_dir=self.config.work_dir)
         else:
@@ -295,7 +273,7 @@ class TrainEngine:
             runtime_env["World Size"] = os.environ["WORLD_SIZE"]
             runtime_env_info = "\n    " + "\n    ".join(f"{k}: {v}" for k, v in runtime_env.items())
             dash_line = "-" * 60
-            get_logger().info("\n" + dash_line + "\nRuntime environment:" + runtime_env_info + "\n" + dash_line + "\n")
+            self.logger.info("\n" + dash_line + "\nRuntime environment:" + runtime_env_info + "\n" + dash_line + "\n")
 
         self.dp_mesh = self.patched_llm.fsdp_config.train_mesh["dp"]
         self.sp_mesh = self.patched_llm.fsdp_config.train_mesh["sp"]
@@ -306,7 +284,7 @@ class TrainEngine:
 
     def setup_optim(self):
         self.total_steps = self.config.total_training_steps
-        get_logger().info(f"Total training steps: {self.total_steps}")
+        self.logger.info(f"Total training steps: {self.total_steps}")
 
         self.train_state = TrainState(total_steps=self.total_steps, seed=self.config.seed)
 
@@ -429,7 +407,7 @@ class TrainEngine:
             total_tokens = int(total_tokens.item())
             total_tokens_with_input = int(total_tokens_with_input.item())
         if total_tokens == 0:
-            get_logger().warning("No supervised tokens in this step, skipping.")
+            self.logger.warning("No supervised tokens in this step, skipping.")
             return {"loss": 0.0, "grad_norm": 0.0, "num_tokens": 0, "tgs": 0}
 
         step_t0 = time.time()
@@ -457,7 +435,7 @@ class TrainEngine:
 
         grad_norm = clip_grad_norm_([param for param in self.patched_llm.parameters() if param.requires_grad], 1.0)
         if grad_norm.isnan() or grad_norm.isinf():
-            get_logger().warning(
+            self.logger.warning(
                 f"[SFT Step {self.train_state.cur_step}] grad norm is NaN/Inf, skipping optimizer step."
             )
         else:
@@ -471,7 +449,7 @@ class TrainEngine:
         step_time = time.time() - step_t0
         tgs = int(total_tokens_with_input / self.config.sp_size / step_time / self.dp_size / self.config.sp_size)
 
-        get_logger().info(
+        self.logger.info(
             f"[SFT] Step {self.train_state.cur_step}/{self.total_steps}  "
             f"loss: {reduced_loss.item():.4f}  "
             f"grad_norm: {grad_norm:.2f}  "
@@ -566,7 +544,7 @@ class TrainEngine:
                 "logprob_diff/entropy_mean": entropy_mean,
             }
         except Exception as e:
-            get_logger().warning(f"Failed to log logprob diff: {e}")
+            self.logger.warning(f"Failed to log logprob diff: {e}")
             raise
         finally:
             gc.collect()
@@ -587,7 +565,7 @@ class TrainEngine:
         num_steps = (len(rl_dataloader) + max_iters_per_step - 1) // max_iters_per_step
 
         data_iter = iter(rl_dataloader)
-        get_logger().info(
+        self.logger.info(
             f"[Train Data] {len(trajectories)} traj are packed to dataloader {len(rl_dataloader)}. {num_steps} steps with {max_iters_per_step} iters per step, "
         )
 
@@ -710,7 +688,7 @@ class TrainEngine:
             # update parameters
             grad_norm = clip_grad_norm_([param for param in self.patched_llm.parameters() if param.requires_grad], 1.0)
             if grad_norm.isnan() or grad_norm.isinf():
-                get_logger().warning(f"[Step {step_i}] The grad norm is NaN or Inf, skip this step.")
+                self.logger.warning(f"[Step {step_i}] The grad norm is NaN or Inf, skip this step.")
             else:
                 self.optimizer.step()
             self.optimizer.zero_grad()
@@ -726,7 +704,7 @@ class TrainEngine:
             entropy_std = torch.sqrt(entropy_var)
             tgs = int(global_reduce_num.item() / step_time / self.dp_size / self.config.sp_size)
 
-            get_logger().info(
+            self.logger.info(
                 f"[RL] (Step {rl_step}) Step "
                 f"{step_i + 1}/{num_steps}  "
                 f"Optimize Step: {self.optimize_steps}  "

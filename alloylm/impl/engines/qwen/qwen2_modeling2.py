@@ -47,12 +47,13 @@ from transformers.models.qwen3 import Qwen3Config
 from transformers.models.qwen3_moe import Qwen3MoeConfig
 from transformers.utils import TransformersKwargs
 
-from alloylm.engine.infer_engine.utils import GatherContext, get_logger
+from alloylm.engine.infer_engine.utils import GatherContext
 from alloylm.engine.model import AlloyLMModel, DeviceSession, TrainInput
 from alloylm.engine.train_engine.utils import (
     DEFAULT_FSDP_CONFIG,
     FSDPConfig,
     HFCheckpointLoader,
+    get_engine_logger,
     lazy_init_fn,
     pad_to_multiple_of,
     split_for_sequence_parallel,
@@ -1019,7 +1020,9 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
             self.config.vocab_size,
             max(tokenizer.vocab_size, max(tokenizer.added_tokens_decoder.keys()) + 1),
         )
-        get_logger().info(f"real_vocab_size: {real_vocab_size}, while model vocab_size: {self.config.vocab_size}")
+        get_engine_logger().info(
+            f"real_vocab_size: {real_vocab_size}, while model vocab_size: {self.config.vocab_size}"
+        )
         return -1 if real_vocab_size == self.config.vocab_size else real_vocab_size
 
     def create_cache(self, memory_usage=0.8, use_cuda_graph=True) -> SwaCacheManager:

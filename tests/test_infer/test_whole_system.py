@@ -3,10 +3,10 @@ import os
 import random
 import unittest
 
-from alloylm.engine.infer_engine.utils import get_logger
 from alloylm.server.client import HighConcurrentClient as AsyncClient
 from alloylm.server.client import enable_interactive_session
 from alloylm.test_utils import CudaAsyncTestCase, LaunchTestServer
+from alloylm.utils import get_logger
 
 logger = get_logger()
 

@@ -21,7 +21,14 @@ from torch.utils._foreach_utils import (
 
 from alloylm.utils import get_logger
 
-logger = get_logger()
+
+def engine_logger_name():
+    return f"ENGINE_{dist.get_rank() if dist.is_initialized() else 0}"
+
+
+def get_engine_logger():
+    return get_logger(engine_logger_name())
+
 
 # for trainer pipeline
 
@@ -35,8 +42,9 @@ def profile_time_and_memory(desc):
 
     max_memory = torch.cuda.max_memory_allocated()
     cost_time = time.time() - start_t
-
-    get_logger().success(f"{desc} Elapsed time {cost_time:.2f} seconds, peak gpu memory {max_memory / 1024**3:.1f}G")
+    get_engine_logger().info(
+        f"{desc} Elapsed time {cost_time:.2f} seconds, peak gpu memory {max_memory / 1024**3:.1f}G"
+    )
 
 
 # for checkpoint
@@ -92,7 +100,7 @@ def lazy_init_fn(module, module2name, checkpoint_loader, enable_fp8=False, ep_me
         if param.shape == params[name].shape:
             param.data.copy_(params[name])
         else:
-            logger.warning(
+            get_engine_logger().warning(
                 f"The shape of {module_name}.{name}({param.shape}) "
                 f"is inconsistent with that in the checkpoint({params[name].shape}), "
                 "it is initialized to 0 by default."
@@ -106,7 +114,7 @@ def lazy_init_fn(module, module2name, checkpoint_loader, enable_fp8=False, ep_me
             if buffer.shape == _buffer.shape:
                 buffer.data.copy_(_buffer)
             else:
-                logger.warning(
+                get_engine_logger().warning(
                     f"The shape of {module_name}.{name}({buffer.shape}) "
                     f"is inconsistent with that in the checkpoint({_buffer.shape}), "
                     "it is initialized to 0 by default."
@@ -179,9 +187,8 @@ class HFCheckpointLoader:
 
     def load(self, key):
         if key not in self.weight_map:
+            get_engine_logger().warning(f"{key} not in checkpoint.")
             raise KeyError(f"{key} not found in checkpoint.")
-            logger.warning(f"{key} not in checkpoint.")
-            return
 
         _file = self.weight_map[key]
 

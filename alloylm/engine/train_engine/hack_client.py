@@ -18,14 +18,12 @@ from alloylm.server.client import (
     HighConcurrentClientInteractive as BaseAsyncClientInteractive,
 )
 
-logger = get_logger()
-
 
 def log_once(message: str):
     if not hasattr(log_once, "logged_messages"):
         log_once.logged_messages = set()
     if message not in log_once.logged_messages:
-        logger.info(message)
+        get_logger().info(message)
         log_once.logged_messages.add(message)
 
 
@@ -60,7 +58,7 @@ class OutputChecker:
 
     async def check(self, question, output: str):
         if self.model_name is None:
-            self.model_name = requests.get(f"{self.url}/models").json()["data"][0]["id"]
+            self.model_name = requests.get(f"{self.url}/models").json()["data"][0]["id"]  # noqa
         if len(output) < 256:
             return "appropriate"
         output = output.strip()[-1000:]
@@ -95,7 +93,7 @@ Only output A, B, nothing else.
 
 
 class CollectTokenClient:
-    collected_tokens = defaultdict(deque)
+    collected_tokens = defaultdict(deque)  # noqa
     step_index = 0
 
     @classmethod
@@ -248,10 +246,10 @@ class HighConcurrentClient(BaseAsyncClient, CollectTokenClient):
                     }
         except Exception as e:
             report_error_once(f"Exception in _generate_once: {e}")
-            raise e
+            raise
 
     async def _generate(self, messages, **kwargs):
-        timeout = kwargs.pop("timeout", int(os.environ.get("ALLOYLM_TIMEOUT", 3600)))
+        timeout = kwargs.pop("timeout", int(os.environ.get("ALLOYLM_TIMEOUT", 3600)))  # noqa
         chat_template = kwargs.pop("chat_template", None) or self.chat_template
 
         input_str = chat_template.render(messages=messages, add_generation_prompt=True)

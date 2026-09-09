@@ -10,31 +10,32 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel as PydanticBaseModel
 
-from alloylm.engine.infer_engine.utils import get_logger
+from alloylm.engine.train_engine.utils import get_engine_logger as get_logger
 
 # method
 
 
-_collected_error = set()
-
-
 def report_error_once(message: str):
-    global _collected_error
-    global logger
+    if not hasattr(report_error_once, "_collected_error"):
+        report_error_once._collected_error = set()
+    _collected_error = report_error_once._collected_error
+
     if message not in _collected_error:
         get_logger().critical(message)
         _collected_error.add(message)
 
 
 async def simple_forward_request(request_content: dict, url):
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0)) as client:
-        async with client.post(url, json=request_content, timeout=7200) as response:
-            assert response.status == 200, f"Request failed with status {response.status}, {await response.text()}"
-            text = await response.text()
-            try:
-                return json.loads(text)
-            except Exception:
-                return text
+    async with (
+        aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0)) as client,
+        client.post(url, json=request_content, timeout=7200) as response,
+    ):
+        assert response.status == 200, f"Request failed with status {response.status}, {await response.text()}"
+        text = await response.text()
+        try:
+            return json.loads(text)
+        except Exception:  # noqa
+            return text
 
 
 PROXY_METHOD_MAPPING = {"default": simple_forward_request}
@@ -70,6 +71,8 @@ class ProxyServer:
             self.method = custom_method.method
         else:
             self.method = PROXY_METHOD_MAPPING[method]
+
+        self.logger = get_logger()
 
     def get_ip(self):
         return self.ip
@@ -121,9 +124,9 @@ class ProxyServer:
         try:
             loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(self.force_stop(signal.SIGTERM)))
             loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(self.force_stop(signal.SIGINT)))
-        except Exception as e:
-            get_logger().warning(f"Failed to set signal handlers: {e}")
-        get_logger().info(f"Launched Proxy Server running on {self.ip}:{self.port} with {self.method_name} method")
+        except Exception as e:  # noqa
+            self.logger.warning(f"Failed to set signal handlers: {e}")
+        self.logger.info(f"Launched Proxy Server running on {self.ip}:{self.port} with {self.method_name} method")
 
     async def chat_completion(self, request: Request):
         return await self.transmit(request, post_url="v1/chat/completions")
@@ -165,7 +168,7 @@ class ProxyServer:
         return await self.transmit(request, post_url="generate", server_url=server_url)
 
     async def abort_request(self, request: Request):
-        all_urls = {url for servers in self.servers.values() for url in servers.keys()}
+        all_urls = {url for servers in self.servers.values() for url in servers}
         futures = [
             asyncio.create_task(self.transmit(request, post_url="abort_request", server_url=url)) for url in all_urls
         ]
@@ -190,9 +193,9 @@ class ProxyServer:
 
             # Create task and wait with disconnect check
             return await self.method(request_content, server_url + "/" + post_url)
-        except HTTPException as e:
-            raise e
-        except Exception as e:
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa
             report_error_once(f"Error in transmit: {e}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=f"Error in transmit: {e}\n{traceback.format_exc()}")
         finally:
@@ -205,7 +208,7 @@ class ProxyServer:
                 self.servers[model] = {}
             if request.url not in self.servers[model]:
                 self.servers[model][request.url] = 0
-        get_logger().info(f"Added server {request.url} for models {request.status.models}")
+        self.logger.info(f"Added server {request.url} for models {request.status.models}")
         return {"status": "added"}
 
     async def remove(self, request: ServerAddRequest):
@@ -215,14 +218,14 @@ class ProxyServer:
                 self.servers[model].pop(request.url)
                 exist = True
         if not exist:
-            get_logger().info("No such server to remove.")
+            self.logger.info("No such server to remove.")
             return {"status": "not exist"}
         else:
-            get_logger().info(f"Remove server {request.url} for models {request.status.models}")
+            self.logger.info(f"Remove server {request.url} for models {request.status.models}")
             return {"status": "removed"}
 
     async def models(self):
-        return {"data": [{"id": model, "object": "model"} for model in self.servers.keys()]}
+        return {"data": [{"id": model, "object": "model"} for model in self.servers]}
 
     # stop server
 
@@ -232,7 +235,7 @@ class ProxyServer:
             await self.task
             self.task = None
             self.server = None
-            get_logger().info(f"Proxy server on {self.port} stopped successfully")
+            self.logger.info(f"Proxy server on {self.port} stopped successfully")
 
     async def wait_closed(self):
         if self.task is not None:

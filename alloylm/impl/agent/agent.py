@@ -57,7 +57,7 @@ class BaseAgent:
             message_data = {"role": message.role, "content": message.content}
             if message.tool_calls:
                 message_data["tool_calls"] = [call.model_dump(exclude_none=True) for call in message.tool_calls]
-            if message.reasoning_content:
+            if hasattr(message, "reasoning_content") and message.reasoning_content:
                 message_data["reasoning_content"] = message.reasoning_content
             self.messages.append(message_data)
 

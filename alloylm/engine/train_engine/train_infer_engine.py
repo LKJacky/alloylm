@@ -24,6 +24,7 @@ from ..infer_engine.infer_bank import InferBank
 from .hack_client import HighConcurrentClient as AsyncClient
 from .hack_client import HighConcurrentClientInteractive as AsyncClientInteractive
 from .train_engine import RLInput, TrainEngine, TrainEngineConfig
+from .utils import engine_logger_name
 
 logger = get_logger()
 
@@ -65,6 +66,16 @@ class TrainInferEngine:
             self.model,
             self.tokenizer,
             config=self.args.train_config,
+        )
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        self.logger = get_logger(
+            engine_logger_name(),
+            path=os.path.join(
+                engine_config.train_config.work_dir,
+                f"engine_rank{rank}.log",
+            ),
+            output_to_stdout=False,
+            force_recreate=True,
         )
 
     async def lazy_init(self):
@@ -154,7 +165,8 @@ class SpmdTrainInferEngine:
             padding_side="right",
             trust_remote_code=True,
         )
-        get_logger().info(f"launch {engine_config.train_config.num_workers} model actors")
+        self.logger = get_logger()
+        self.logger.info(f"launch {engine_config.train_config.num_workers} model actors")
         self.actor: TrainInferEngine = SPMDActor.create_spmd_actor(
             TrainInferEngine,
             args=(model_config, engine_config),

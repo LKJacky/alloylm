@@ -30,11 +30,9 @@ from alloylm.engine.train_engine.train_infer_engine import (
     TrainInferEngineConfig,
 )
 
-from ...utils import init_logger
 from .utils import DummySummaryWriter, MeasureTime
 
 DEFAULT_MODEL_NAME = "ALLOYLM"
-logger = get_logger()
 tb_writer = get_tb_writer()
 
 
@@ -154,10 +152,10 @@ class BaseRepeatTask(Task):
             results = await asyncio.gather(*futures)
             return await self.post_process(results)
         except RuntimeError as e:
-            logger.critical(f"Runtime Error: {e}")
+            get_logger().critical(f"Runtime Error: {e}")
             return {"result": [], "filter": "error"}
         except Exception as e:  # noqa: BLE001
-            logger.critical(f"BaseRepeatTask encountered an error: {e}\n{traceback.format_exc()}")
+            get_logger().critical(f"BaseRepeatTask encountered an error: {e}\n{traceback.format_exc()}")
             return {"result": [], "filter": "error"}
 
     async def post_process(self, results: list[TaskData]):
@@ -213,7 +211,7 @@ class TaskSampler:
             idx = self.wait.popleft()
             if idx is None:
                 self.epoch += 1
-                logger.warning(f"{self.name} All tasks finished, reshuffling. Starting epoch {self.epoch}.")
+                get_logger().warning(f"{self.name} All tasks finished, reshuffling. Starting epoch {self.epoch}.")
                 self.tb_writer.add_scalar(f"sampler/{self.name}_epoch", self.epoch, global_step=self.epoch)
                 self.rng.shuffle(self.wait)
                 self.wait.append(idx)
@@ -249,7 +247,7 @@ class RatioSampler:
         self.rng = random.Random()
         self.num_per_epoch = int(len(datasets[0]) / self.sample_ratios[0])
 
-        logger.info(
+        get_logger().info(
             f"Initialized RatioSampler with datasets: {[d.config.name for d in datasets]}, with sample ratio: {self.sample_ratios}"
         )
 
@@ -285,7 +283,7 @@ async def aquire_semaphore(semaphore: asyncio.Semaphore, num=1):
             semaphore.release()
         raise asyncio.CancelledError()
     except Exception as e:  # noqa: BLE001
-        logger.critical(f"Error in acquiring semaphore: {e}\n{traceback.format_exc()}")
+        get_logger().critical(f"Error in acquiring semaphore: {e}\n{traceback.format_exc()}")
     return num_acquired
 
 
@@ -321,7 +319,9 @@ class TrainTask(Task):
         super().__init__()
         self.tb_writer = tb_writer
         self.task_sampler = RatioSampler(datasets, sample_ratios, tb_writer=tb_writer)
-        logger.info(f"Initialized TrainTask, about {self.task_sampler.num_per_epoch // rollout_bs} steps per epoch.")
+        get_logger().info(
+            f"Initialized TrainTask, about {self.task_sampler.num_per_epoch // rollout_bs} steps per epoch."
+        )
         self.sampler_iter = iter(self.task_sampler)
 
         self.rollout_bs = rollout_bs
@@ -473,7 +473,7 @@ class SingleEvalTask(Task):
         else:
             self.index = random.sample(range(len(self.dataset)), math.ceil(len(self.dataset) * sample_ratio))
 
-        logger.info(
+        get_logger().info(
             f"Eval Task on dataset {self.dataset.config.name}, sample ratio: {self.sample_ratio}, num samples: {len(self.index)}"
         )
 
@@ -486,10 +486,10 @@ class SingleEvalTask(Task):
                         task_data = await task_item.task_cls.eval(task_data)
                     return task_data
                 except RuntimeError as e:
-                    logger.critical(f"Runtime Error: {e}")
+                    get_logger().critical(f"Runtime Error: {e}")
                     return None
                 except Exception as e:  # noqa: BLE001
-                    logger.critical(
+                    get_logger().critical(
                         f"Eval task encountered an error on dataset {self.dataset.config.name}: {e}\n{traceback.format_exc()}"
                     )
                     return None
@@ -504,7 +504,7 @@ class SingleEvalTask(Task):
             results.append(await future)
         results = [x for x in results if x is not None]
         if len(results) != len(futures):
-            logger.warning(
+            get_logger().warning(
                 f"Some eval tasks failed on dataset {self.dataset.config.name}, {len(results)}/{len(futures)} succeeded."
             )
         for item in results:
@@ -619,14 +619,14 @@ class RLAlgorithm:
     async def resume(self, folder):
         path = os.path.join(folder, "algo.json")
         if not os.path.exists(path):
-            logger.warning(f"No checkpoint found at {path}, skipping resume.")
+            get_logger().warning(f"No checkpoint found at {path}, skipping resume.")
             return
         async with aiofiles.open(path, "r") as f:
             data = json.loads(await f.read())
 
         self.train_task.resume(data["train_task"])
         self.global_step = data["global_step"]
-        logger.info(f"Resumed AsyncAlgorithm from {path}, global step: {self.global_step}")
+        get_logger().info(f"Resumed AsyncAlgorithm from {path}, global step: {self.global_step}")
         return self.global_step
 
     async def checkpoint(self, folder):
@@ -649,7 +649,7 @@ class RLAlgorithm:
             finish_reasons = defaultdict(int)
             for x in data:
                 finish_reasons[x.finish_reason] += 1
-            logger.info(
+            get_logger().info(
                 f"[{key}][Step {step}] Num samples: {len(data)}, Avg reward: {np.mean(rewards):.4f}, Accuracy: {accuracy:.4f}, Avg length: {length:.2f}, finish_reason: {dict(finish_reasons)}"
             )
             self.tb_writer.add_scalar(f"{key}/avg_reward", np.mean(rewards), global_step=step)
@@ -681,7 +681,9 @@ class RLAlgorithm:
         reward_avg = np.mean([r["avg_reward"] for r in result.values()])
         self.tb_writer.add_scalar(key + "_all/reward", reward_avg, global_step=step)
         self.tb_writer.add_scalar(key + "_all/accuracy", acc_avg, global_step=step)
-        logger.info(f"[{key}][Step {step}] Avg accuracy across eval sets: {acc_avg:.4f}; Avg reward: {reward_avg:.4f}")
+        get_logger().info(
+            f"[{key}][Step {step}] Avg accuracy across eval sets: {acc_avg:.4f}; Avg reward: {reward_avg:.4f}"
+        )
 
         return result, reward_avg
 
@@ -715,10 +717,9 @@ class RLTrainer:
 
         self.cur_step = 0
 
-        init_logger(self.config.work_dir + "/trainer.log")
         DummySummaryWriter.init_writer(self.config.work_dir)
 
-        self.logger = get_logger()
+        self.logger = get_logger(path=self.config.work_dir + "/algo.log", output_to_stdout=True, force_recreate=True)
         self.tb_writer = get_tb_writer()
 
         self.logger.info(str(self.algorithm.args.model_dump()))

@@ -1,7 +1,10 @@
 import json
+import logging
 import os
 import socket
 import sys
+from pathlib import Path
+from threading import Lock
 
 import orjson
 
@@ -28,40 +31,42 @@ def dispatch_triton():
         dispatch_triton.TRITON_CONFIG_DISPATCHED = True
 
 
-_logger_instance = None
+_logger_lock = Lock()
 
 
-def log_format(rank, debug=False):
-    formatter = f"[AlloyLM][RANK {rank}]"
-    formatter += "[{time:YYYY-MM-DD HH:mm:ss}][<level>{level}</level>]"
+def get_logger(
+    name: str = "default",
+    path: str | os.PathLike[str] | None = None,
+    output_to_stdout: bool = True,
+    log_level: int | str = logging.INFO,
+    force_recreate: bool = False,
+) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
 
-    # if debug:
-    #     formatter += "[<cyan>{name}</cyan>:"
-    #     formatter += "<cyan>{function}</cyan>:"
-    #     formatter += "<cyan>{line}</cyan>]"
+    with _logger_lock:
+        if force_recreate or not logger.handlers:
+            for handler in logger.handlers[:]:
+                logger.removeHandler(handler)
+                handler.close()
+            formatter = logging.Formatter(
+                f"[AlloyLM][{name}][%(asctime)s][%(levelname)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+            if path:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                file_handler = logging.FileHandler(path)
+                file_handler.setLevel(logging.DEBUG)
+                file_handler.setFormatter(formatter)
+                logger.addHandler(file_handler)
 
-    formatter += " <level>{message}</level>"
-    return formatter
-
-
-def get_logger(level="INFO"):
-    from loguru import logger
-
-    global _logger_instance
-    if _logger_instance is None:
-        # Remove the original logger in Python to prevent duplicate printing.
-        logger.remove()
-        logger.add(sys.stderr, level=level, format=log_format(0, debug=level == "DEBUG"))
-        _logger_instance = logger
-    return _logger_instance
-
-
-def init_logger(log_file):
-    global _logger_instance  # noqa: PLW0602
-    _logger_instance.remove()
-    log_file = os.path.join(log_file)
-    _logger_instance.add(sys.stderr, level="INFO", format=log_format(0, False))
-    _logger_instance.add(log_file, level="DEBUG", format=log_format(0, True), backtrace=True, catch=True)
+            if output_to_stdout:
+                stdout_handler = logging.StreamHandler(sys.stdout)
+                stdout_handler.setLevel(log_level)
+                stdout_handler.setFormatter(formatter)
+                logger.addHandler(stdout_handler)
+    return logger
 
 
 def write_jsonl(file_path, data):

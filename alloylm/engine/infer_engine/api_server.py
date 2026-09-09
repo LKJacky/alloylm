@@ -21,9 +21,11 @@ from pydantic import BaseModel, Field
 from pydantic import BaseModel as _BaseModel
 from transformers import AutoTokenizer
 
+from alloylm.engine.train_engine.utils import get_engine_logger as get_logger
+
 from .infer_bank import InferBank
 from .scheduler import InferItem, ReleaseItem, ResetItem, TaskItem
-from .utils import GeneConfig, get_current_ip, get_logger
+from .utils import GeneConfig, get_current_ip
 
 
 class ModelCard(_BaseModel):
@@ -118,7 +120,7 @@ class ChatCompletionRequest(BaseModel):
 
     def clean(self):
         if self.max_completion_tokens is not None and self.max_tokens is not None:
-            get_logger().warn("Both max_completion_tokens and max_tokens are provided, using max_completion_tokens")
+            get_logger().warning("Both max_completion_tokens and max_tokens are provided, using max_completion_tokens")
         self.max_completion_tokens = self.max_completion_tokens if self.max_completion_tokens else self.max_tokens
 
 
@@ -225,11 +227,12 @@ class APIServer:
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Hello!"},
         ]
-        get_logger().info(f"Using chat template:\n{self.chat_template.render(messages=test_messages)}")
-        get_logger().info(
+        self.logger = get_logger()
+        self.logger.info(f"Using chat template:\n{self.chat_template.render(messages=test_messages)}")
+        self.logger.info(
             f"Using chat template:\n{self.chat_template.render(messages=test_messages, add_generation_prompt=True, enable_thinking=False)}"
         )
-        get_logger().info(
+        self.logger.info(
             f"Using chat template:\n{self.chat_template.render(messages=test_messages + [{'role': 'assistant', 'content': 'Hi!'}])}"
         )
 
@@ -244,7 +247,7 @@ class APIServer:
         self.session_map: dict[int, SessionItem] = {}
 
         self.default_stop_tokens = [self.tokenizer.eos_token_id]
-        get_logger().info(
+        self.logger.info(
             f"Use eos token {self.tokenizer.eos_token}({self.tokenizer.eos_token_id}) as default stop token"
         )
         self.tool_pattern = re.compile(tool_pattern, re.DOTALL) if tool_pattern else None
@@ -300,8 +303,8 @@ class APIServer:
                     await asyncio.sleep(0.001)
                 break
             except Exception as e:  # noqa
-                get_logger().error(f"Failed to launch API server on port {self.port}: {e}")
-                get_logger().error("Retrying in 1 second...")
+                self.logger.error(f"Failed to launch API server on port {self.port}: {e}")
+                self.logger.error("Retrying in 1 second...")
                 self.port += 1  # Increment port to avoid conflicts
                 await asyncio.sleep(1)
 
@@ -321,14 +324,14 @@ class APIServer:
                 try:
                     response = await client.post(url, headers=headers, json=data)
                     if response.status_code != 200:
-                        get_logger().error(f"Service registration failed: {response.text}")
+                        self.logger.error(f"Service registration failed: {response.text}")
                         raise HTTPException(status_code=400, detail="Service registration failed")
                     break
                 except httpx.ConnectError:
                     await asyncio.sleep(0.01)  # wait for proxy launched
             await client.aclose()
 
-        get_logger().info(f"API server launched successfully on port {self.port}")
+        self.logger.info(f"API server launched successfully on port {self.port}")
 
     async def chat_completion(self, request: ChatCompletionRequest):
         request.clean()
@@ -469,7 +472,7 @@ class APIServer:
                     }
                 )
         except Exception as e:  # noqa
-            get_logger().error(f"Error in chat_interactive: {e}\n{traceback.format_exc()}")
+            self.logger.error(f"Error in chat_interactive: {e}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(e) + "\n" + traceback.format_exc())
 
     async def generate(self, request: GenerateReqInput):
@@ -526,17 +529,17 @@ class APIServer:
             try:
                 await asyncio.wait_for(self.task, timeout=10)
             except TimeoutError:
-                get_logger().error("API server did not stop within timeout, forcing shutdown")
+                self.logger.error("API server did not stop within timeout, forcing shutdown")
                 self.server.force_exit = True
                 try:
                     await self.task
                 except asyncio.CancelledError:
                     pass
                 except Exception as e:  # noqa: BLE001
-                    get_logger().error(f"Error while forcing API server shutdown: {e}")
+                    self.logger.error(f"Error while forcing API server shutdown: {e}")
             self.task = None
             self.server = None
-            get_logger().info(f"API server on {self.port} stopped successfully")
+            self.logger.info(f"API server on {self.port} stopped successfully")
 
     async def wait_closed(self):
         if self.task is not None:

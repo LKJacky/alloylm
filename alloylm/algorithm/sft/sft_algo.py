@@ -21,7 +21,6 @@ from alloylm.engine.train_engine.train_infer_engine import (
     SpmdTrainInferEngine,
     TrainInferEngineConfig,
 )
-from alloylm.utils import init_logger
 
 
 class ChatTemplate:
@@ -116,9 +115,8 @@ class SFTTrainer:
         self.global_step = 0
         self.cur_step = 0
 
-        init_logger(self.config.work_dir + "/trainer.log")
         DummySummaryWriter.init_writer(self.config.work_dir)
-        self.logger = get_logger()
+        self.logger = get_logger(path=self.config.work_dir + "/algo.log", output_to_stdout=True, force_recreate=True)
         self.tb_writer = get_tb_writer()
 
         self.logger.info(str(self.config.model_dump()))

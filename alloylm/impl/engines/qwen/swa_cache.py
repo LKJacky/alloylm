@@ -6,8 +6,7 @@ from pydantic import BaseModel
 from torch.nn import functional as F
 
 from alloylm.engine.model import Cache, DeviceSession
-
-from ....engine.infer_engine.utils import get_logger
+from alloylm.engine.train_engine.utils import get_engine_logger
 
 # functions
 
@@ -23,7 +22,7 @@ def packed_cumulative_length(num_tokens: torch.Tensor):
 
 class InferKernel:
     _prefill_kernel = None
-    _decode_kernel = {}
+    _decode_kernel = {}  # noqa: RUF012
 
     _float_workspace_buffer = None
 
@@ -64,14 +63,14 @@ class InferKernel:
     @classmethod
     def decode_kernel(cls, batch_size, cuda_graph=False):
         if cuda_graph:
-            kwargs = dict(
-                use_cuda_graph=True,
-                paged_kv_indptr_buffer=cls._paged_kv_indptr_buffer[: batch_size + 1],
-                paged_kv_indices_buffer=cls._paged_kv_indices_buffer,
-                paged_kv_last_page_len_buffer=cls._paged_kv_last_page_len_buffer[:batch_size],
-            )
+            kwargs = {
+                "use_cuda_graph": True,
+                "paged_kv_indptr_buffer": cls._paged_kv_indptr_buffer[: batch_size + 1],
+                "paged_kv_indices_buffer": cls._paged_kv_indices_buffer,
+                "paged_kv_last_page_len_buffer": cls._paged_kv_last_page_len_buffer[:batch_size],
+            }
         else:
-            kwargs = dict()
+            kwargs = {}
             batch_size = 0
         if batch_size not in cls._decode_kernel:
             cls._decode_kernel[batch_size] = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
@@ -203,7 +202,7 @@ class SwaCacheManager(Cache):
         num_layers=32,
         num_head=32,
         head_dim=128,
-        window_size=[4096],
+        window_size=(4096,),
         block_size=16,
         memory_usage=0.8,
         pad_size=8,
@@ -215,7 +214,7 @@ class SwaCacheManager(Cache):
         self.num_layer = num_layers
         self.num_head = num_head
         self.head_dim = head_dim
-        self.window_size = [ws for ws in window_size][0]
+        self.window_size = next(iter(window_size))
         self.block_size = block_size
         self.memory_usage = memory_usage
         self.pad_size = pad_size
@@ -254,7 +253,9 @@ class SwaCacheManager(Cache):
             self.max_length = self.total_num_blocks * self.block_size
         else:
             self.max_length = 1000**3  # no length limitation for window attention
-        get_logger().info(f"Init Cache for {self.max_length} tokens, max decode batch size {self.max_batch_size}")
+        get_engine_logger().info(
+            f"Init Cache for {self.max_length} tokens, max decode batch size {self.max_batch_size}"
+        )
 
         InferKernel.init_buffer(
             max_num_page=self.total_num_blocks + self.pad_size, max_batch_size=self.max_batch_size
@@ -412,7 +413,7 @@ class SwaCacheManager(Cache):
                 self.free_blocks.update(released_blocks)
                 session.cached_num -= num_release * self.block_size
 
-    def cache_usage(self, device_sessions: list[AttentionDeviceSession] = None):
+    def cache_usage(self, device_sessions: list[AttentionDeviceSession] | None = None):
         if not self._prepared:
             return 0.0
         if device_sessions is None:

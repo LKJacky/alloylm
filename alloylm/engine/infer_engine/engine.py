@@ -9,15 +9,13 @@ from torch import distributed as dist
 from transformers import AutoTokenizer
 
 from alloylm.engine.infer_engine.proxy_server import ProxyServer
-from alloylm.engine.infer_engine.utils import get_free_port
 from alloylm.engine.model import AlloyLMModelConfig
-from alloylm.utils import get_logger
+from alloylm.engine.train_engine.utils import get_engine_logger as get_logger
+from alloylm.utils import get_free_port
 
 from .api_server import APIServer
 from .scheduler import SchedulerServer
 from .utils import GatherContext
-
-logger = get_logger()
 
 # inference engine
 
@@ -47,7 +45,8 @@ class InferEngine:
 
         cache = model.create_cache(memory_usage=engine_config.memory_usage)
         real_vocab_size = model.get_real_vocab_size(tokenizer)
-        get_logger().info(f"Real vocab size: {real_vocab_size}")
+        self.logger = get_logger()
+        self.logger.info(f"Real vocab size: {real_vocab_size}")
         self.scheduler_server = SchedulerServer(
             model=model,
             cache=cache,

@@ -7,9 +7,10 @@ import torch
 from sortedcontainers import SortedList
 
 from alloylm.engine.model import AlloyLMModel, Cache, DeviceSession
+from alloylm.engine.train_engine.utils import get_engine_logger as get_logger
 
 from .sampler import BatchSampler
-from .utils import GeneConfig, get_logger
+from .utils import GeneConfig
 
 # action
 
@@ -182,6 +183,7 @@ class SchedulerServer:
 
         self.top_cache_usage_for_decode = 0.9
         self.bottom_cache_usage_for_decode = 0.7
+        self.logger = get_logger()
 
         self.num_prefill_tokens = 0
         self.num_decode_tokens = 0
@@ -202,7 +204,7 @@ class SchedulerServer:
             session: TaskItem = await self.wait_queue.get()
             if isinstance(session, InferItem):
                 if session.gene_config.total_max_length >= self.max_infer_length:
-                    get_logger().warning(
+                    self.logger.warning(
                         f"Requested max length {session.gene_config.total_max_length} exceeds engine limit {self.max_infer_length}, truncating."
                     )
                     await self.finish_item(session, session, reason="length")
@@ -219,7 +221,7 @@ class SchedulerServer:
                     )
                     if sample_arg not in self.fowarded_sample_config:
                         self.fowarded_sample_config.add(sample_arg)
-                        get_logger().debug(
+                        self.logger.debug(
                             f"Request: temperature: {session.gene_config.temperature}, top_k: {session.gene_config.top_k}, top_p: {session.gene_config.top_p}, entropy: {session.gene_config.max_entropy}"
                         )
             elif isinstance(session, ResetItem):
@@ -333,7 +335,7 @@ class SchedulerServer:
                 )
                 self.decode_queue.extend(part_sessions if whether_decode[-1] else part_sessions[:-1])
         if total_num_release > 0:
-            get_logger().debug(f"Reset {total_num_release} for prefill")
+            self.logger.debug(f"Reset {total_num_release} for prefill")
         return num_prefill_sessions, num_prefill_tokens
 
     async def decode(self):
@@ -357,7 +359,7 @@ class SchedulerServer:
                     self.decode_queue.insert(0, session)
                     break
         if num_reset_sessions != 0:
-            get_logger().debug(f"Reset {num_reset_sessions} for decode")
+            self.logger.debug(f"Reset {num_reset_sessions} for decode")
 
         # decode
         if len(decode_sessions) > 0:
@@ -392,7 +394,7 @@ class SchedulerServer:
         def log_decode(decode_status, engine_status=None):
             if decode_status["step"] > 0:
                 num_tokens = decode_status["batch"] * decode_status["step"]
-                get_logger().debug(
+                self.logger.debug(
                     f"Decode:\tbatch: {decode_status['batch']},\tstep:   {decode_status['step']}\tThroughput: {int(num_tokens / (max(time.time() - decode_status['start'], 1e-5))):>5} tokens/s\t"
                     + (engine_status if engine_status is not None else get_engine_status())
                 )
@@ -441,7 +443,7 @@ class SchedulerServer:
                     await asyncio.sleep(0)  # yield to server for finishing tasks
 
             except Exception as e:
-                get_logger().error(f"Scheduler server encountered an error: {e}")
+                self.logger.error(f"Scheduler server encountered an error: {e}")
                 print("Full traceback:", traceback.format_exc())
                 raise
 
@@ -453,7 +455,7 @@ class SchedulerServer:
         self.model.infer_shard(self.max_prefill_length)
         task = loop.create_task(self._serve())
         self.task = task
-        get_logger().info("launch scheduler successfully")
+        self.logger.info("launch scheduler successfully")
 
     async def pause(self):
         await self.wait_queue.put(ReleaseItem(-1))
@@ -490,7 +492,7 @@ class SchedulerServer:
             while self.wait_queue.qsize() > 0:
                 session = self.wait_queue.get_nowait()
                 await self.finish_item(session, session, reason="abort")
-        get_logger().info("Scheduler server stopped successfully")
+        self.logger.info("Scheduler server stopped successfully")
 
     async def finish_item(self, item: TaskItem, result, reason="stop"):
         if isinstance(item, InferItem):

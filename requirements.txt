@@ -15,7 +15,6 @@ huggingface_hub>=0.20.0
 jinja2>=3.1.0
 
 # --- General Utilities ---
-loguru>=0.7.0
 math-verify>=0.5.0
 
 # --- Training Utilities ---
@@ -27,7 +26,11 @@ pandas>=2.0.0
 
 # for test
 parameterized>=0.9.0
+
+# --- dev ---
+pre-commit
 pydantic>=2.0.0
+pytest
 
 # --- Distributed ---
 ray[default]>=2.9.0

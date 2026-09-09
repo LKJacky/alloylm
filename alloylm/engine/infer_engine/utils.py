@@ -4,12 +4,6 @@ import socket
 from torch import distributed as dist
 from torch.distributed._composable.fsdp import FSDPModule
 
-from alloylm.engine.train_engine.utils import get_logger
-from alloylm.utils import get_free_port
-
-logger = get_logger()
-get_free_port = get_free_port
-
 
 class GeneConfig:
     def __init__(
@@ -17,7 +11,7 @@ class GeneConfig:
         temperature=1.0,
         top_k=40,
         top_p=1.0,
-        stop_token=[],
+        stop_token=(),
         total_max_length=4096,
         max_entropy=100,
         release_at_once=False,
