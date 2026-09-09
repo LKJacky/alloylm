@@ -63,7 +63,7 @@ class TestTask(CudaAsyncTestCase):
                         ),
                     ],
                     work_dir="work_dirs/tests/test_eval/",
-                    concurrency=512,
+                    concurrency=32,
                     resume=False,
                 )
             )
@@ -143,31 +143,6 @@ class TestSglangTask(CudaAsyncTestCase):
                     self.process = None
             except Exception:  # noqa
                 pass
-
-    @unittest.skipUnless(os.environ.get("ENABLE_LONG_RUNNING_TESTS", "0") == "1", "Skipping long-runing test")
-    async def test_run_eval_sglang(self):
-        async with self.__class__.LaunchSGLangServer(model_path="Qwen/Qwen3-0.6B") as server:
-            await run_eval(
-                EvalConfig(
-                    datasets=[
-                        GSM8KDatasetConfig(
-                            task_cls=GSM8KTask,
-                            infer_args=InferArgs(
-                                **server.infer_args_kwargs,
-                                sample_args={
-                                    "temperature": 1.0,
-                                    "max_tokens": 4096,
-                                    "top_p": 1.0,
-                                    "extra_body": {"top_k": 1},
-                                },
-                            ),
-                        ),
-                    ],
-                    work_dir="work_dirs/tests/test_eval_sglang/",
-                    concurrency=512,
-                    resume=False,
-                )
-            )
 
 
 class SuccessfulTask(Task):

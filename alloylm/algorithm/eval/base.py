@@ -49,6 +49,99 @@ async def save_to_file(queue: asyncio.Queue, file_path: str, create_new=False):
                 os.remove(file_path + ".bak")
 
 
+class ProducerConsumer:
+    def __init__(self):
+        self.logger = get_logger(__name__)
+
+    async def produce(
+        self,
+        semaphore,
+        running_futures: asyncio.Queue,
+        produce_iter: iter,
+    ):
+        try:
+            while True:
+                await semaphore.acquire()
+                try:
+                    future = next(produce_iter)
+                except StopIteration:
+                    semaphore.release()
+                    break
+                except BaseException as e:
+                    semaphore.release()
+                    self.logger.critical(f"Error in produce: {e}", exc_info=True)
+                    return
+                await running_futures.put(future)
+        except asyncio.CancelledError:
+            pass
+        except BaseException as e:
+            self.logger.critical(f"Error in produce: {e}", exc_info=True)
+
+    async def consume(self, semaphore, running_futures: asyncio.Queue, consume_func: callable):
+        produce_task_had_exited = False
+        try:
+            collected_futures = set()
+            while True:
+                if produce_task_had_exited:
+                    while running_futures.qsize() > 0:
+                        collected_futures.add(await running_futures.get())
+                    if len(collected_futures) == 0:
+                        return
+                else:
+                    if running_futures.qsize() > 0 or len(collected_futures) == 0:
+                        future = await running_futures.get()
+                        if future is None:
+                            produce_task_had_exited = True
+                        else:
+                            collected_futures.add(future)
+                        continue
+                    else:  # No new futures to collect, wait for some to complete
+                        pass
+
+                # wait finished items
+                done, _ = await asyncio.wait(collected_futures, return_when=asyncio.FIRST_COMPLETED, timeout=1)
+                for future in done:
+                    collected_futures.remove(future)
+                    semaphore.release()
+                    try:
+                        await consume_func(future)
+                    except BaseException as e:
+                        self.logger.critical(f"Error in consume_func: {e}", exc_info=True)
+        except asyncio.CancelledError:
+            while running_futures.qsize() > 0:
+                future = await running_futures.get()
+                if future is not None:
+                    collected_futures.add(future)
+            for collected_future in collected_futures:
+                collected_future.cancel()
+                try:
+                    await collected_future
+                except asyncio.CancelledError:
+                    pass
+        except BaseException as e:
+            self.logger.critical(f"Error in consume: {e}", exc_info=True)
+
+    async def run(self, semaphore, produce_iter, consume_func):
+        try:
+            running_futures = asyncio.Queue()
+            # produce and consume tasks
+            produce_task = asyncio.create_task(self.produce(semaphore, running_futures, produce_iter))
+            consume_task = asyncio.create_task(self.consume(semaphore, running_futures, consume_func))
+            done, _ = await asyncio.wait([produce_task, consume_task], return_when=asyncio.FIRST_COMPLETED)
+            if consume_task in done:
+                produce_task.cancel()
+                try:
+                    await produce_task
+                except asyncio.CancelledError:
+                    pass
+            elif produce_task in done:
+                await running_futures.put(None)
+                await consume_task
+        except BaseException as e:
+            self.logger.critical(f"Error in run: {e}", exc_info=True)
+            raise
+
+
 class EvalRunner:
     def __init__(self, datasets: list[Dataset], work_dir=None, resume=False):
         if not isinstance(datasets, list):
@@ -84,42 +177,8 @@ class EvalRunner:
                 resumed[dataset.config.name] = {d["id"]: TaskData(**d) for d in data}
         return resumed
 
-    async def produce(
-        self,
-        semaphore,
-        running_futures,
-        future_to_dataset,
-        resumed,
-        ds_results,
-    ):
-        try:
-            for dataset in self.datasets:
-                ds_resumed = resumed.get(dataset.config.name, {})
-                for item in dataset:
-                    await semaphore.acquire()
-                    try:
-                        if item.task_data.id in ds_resumed:
-                            task_data = ds_resumed[item.task_data.id]
-                            task_data.infer_args = item.task_data.infer_args
-                            ds_results[dataset.config.name].append(task_data)
-                            semaphore.release()
-                            continue
-                        else:
-                            future = asyncio.create_task(self._run_eval_item(item))
-                            running_futures.add(future)
-                            future_to_dataset[future] = dataset.config.name
-                    except BaseException:
-                        semaphore.release()
-                        raise
-        except BaseException as e:
-            self.logger.critical(f"Error in produce: {e}", exc_info=True)
-
     async def run(self, semaphore):
         t0 = time.time()
-        resumed = self._load_resumed_data()
-
-        running_futures = set()
-        future_to_dataset = {}
 
         # Per-dataset save queues and progress bars
         save_queues = {}
@@ -136,31 +195,38 @@ class EvalRunner:
                 asyncio.create_task(save_to_file(save_queues[name], save_path, create_new=not self.resume_enabled))
             )
 
-        produce_task = asyncio.create_task(
-            self.produce(semaphore, running_futures, future_to_dataset, resumed, ds_results)
-        )
-        results = []
+        def produce_func():
+            async def directly_return(x):
+                return x
+
+            resumed = self._load_resumed_data()
+            for dataset in self.datasets:
+                ds_resumed = resumed.get(dataset.config.name, {})
+                for item in dataset:
+                    if item.task_data.id in ds_resumed:
+                        task_data = ds_resumed[item.task_data.id]
+                        task_data.infer_args = item.task_data.infer_args
+                        future = asyncio.create_task(directly_return(task_data))
+                        future._resumed = True
+                    else:
+                        future = asyncio.create_task(self._run_eval_item(item))
+                        future._resumed = False
+                    future._dataset_name = dataset.config.name
+                    yield future
+
+        async def consume_func(future):
+            ds_name = future._dataset_name
+            result = future.result()
+            ds_results[ds_name].append(result)
+            if result and not future._resumed:
+                await save_queues[ds_name].put(result)
+            tqdm_bars[ds_name].update(1)
+
+        await ProducerConsumer().run(semaphore, produce_func(), consume_func)
+
+        # summary
         try:
-            while not produce_task.done() or running_futures:
-                pending = set(running_futures)
-                if not produce_task.done():
-                    pending.add(produce_task)
-                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-
-                if produce_task in done:
-                    produce_task.result()
-                    done.remove(produce_task)
-
-                for future in done:
-                    running_futures.remove(future)
-                    semaphore.release()
-                    ds_name = future_to_dataset.pop(future)
-                    result = future.result()
-                    ds_results[ds_name].append(result)
-                    if result:
-                        await save_queues[ds_name].put(result)
-                    tqdm_bars[ds_name].update(1)
-
+            results = []
             for dataset in self.datasets:
                 name = dataset.config.name
                 origin_num = len(dataset)
@@ -174,14 +240,9 @@ class EvalRunner:
             print("Error in EvalRunner:", e, traceback.format_exc())
             results = []
         finally:
-            produce_task.cancel()
-            for future in running_futures:
-                future.cancel()
-            for t in dump_tasks:
-                t.cancel()
-            await asyncio.gather(produce_task, *running_futures, *dump_tasks, return_exceptions=True)
-            for _ in running_futures:
-                semaphore.release()
+            for task in dump_tasks:
+                task.cancel()
+            await asyncio.gather(*dump_tasks, return_exceptions=True)
 
         if self.work_dir:
             result_dict = {r.dataset_name: r for r in results}
