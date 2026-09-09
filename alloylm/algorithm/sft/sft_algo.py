@@ -10,7 +10,6 @@ from transformers import AutoTokenizer
 
 from alloylm.algorithm.rl.utils import (
     DummySummaryWriter,
-    MeasureTime,
     get_logger,
     get_tb_writer,
 )
@@ -21,7 +20,7 @@ from alloylm.engine.train_engine.train_infer_engine import (
     SpmdTrainInferEngine,
     TrainInferEngineConfig,
 )
-from alloylm.utils import get_chat_template_from_tokenizer
+from alloylm.utils import MeasureTime, get_chat_template_from_tokenizer
 
 # config
 

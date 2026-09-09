@@ -29,8 +29,9 @@ from alloylm.engine.train_engine.train_infer_engine import (
     SpmdTrainInferEngine,
     TrainInferEngineConfig,
 )
+from alloylm.utils import MeasureTime
 
-from .utils import DummySummaryWriter, MeasureTime
+from .utils import DummySummaryWriter
 
 DEFAULT_MODEL_NAME = "ALLOYLM"
 tb_writer = get_tb_writer()
