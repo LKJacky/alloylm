@@ -3,13 +3,18 @@ import os
 import random
 from collections.abc import Callable
 
-import aiofiles
 import orjson
+import ray
+import tqdm
 from pydantic import BaseModel
 from torch.utils.data import Dataset
 
+from alloylm.utils import get_logger
 
-def sft_tokenize(messages, tokenizer, chat_template):
+logger = get_logger()
+
+
+def count_sft_sample(messages, tokenizer, chat_template):
     """Tokenize a conversation exactly as the training engine's ``SFTDataset``
     does.
 
@@ -21,35 +26,21 @@ def sft_tokenize(messages, tokenizer, chat_template):
     conversation encoded in one call does not match, because of segment
     boundaries and implicit special tokens).
     """
-    input_ids = []
+    num_tokens = 0
     pre_text = ""
-    for i, msg in enumerate(messages):
+    for i in range(len(messages)):
         add_gen = (i + 1 < len(messages)) and messages[i + 1]["role"] == "assistant"
         text = chat_template(messages[: i + 1], add_generation_prompt=add_gen)
         toks = tokenizer.encode(text[len(pre_text) :], add_special_tokens=False)
         pre_text = text
-        input_ids.extend(toks)
-    return input_ids
-
-
-async def analyze_jsonl_file(file_path, tokenizer, chat_template):
-    offsets = []
-    num_tokens = []
-    async with aiofiles.open(file_path, encoding="utf-8") as f:
-        # aiofiles iterates via readline(), so tell() reports the byte offset at
-        # the start of each line -- exactly what the engine's seek()+readline()
-        # expects.
-        offsets.append(await f.tell())
-        async for line in f:
-            data = orjson.loads(line)
-            offsets.append(await f.tell())
-            input_ids = await asyncio.to_thread(sft_tokenize, data["messages"], tokenizer, chat_template)
-            num_tokens.append(len(input_ids))
-    return offsets[:-1], num_tokens
+        num_tokens += len(toks)
+    return num_tokens
 
 
 class SFTPackDataset(Dataset):
-    def __init__(self, file_paths, sample_ratios, tokenizer, chat_template, max_length, random_seed=42):
+    def __init__(
+        self, file_paths, sample_ratios, tokenizer, chat_template, max_length, random_seed=42, num_tokenize_workers=-1
+    ):
         self.file_paths, self.sample_ratios = self.get_files_from_folder(file_paths, sample_ratios)
 
         self.tokenizer = tokenizer
@@ -60,26 +51,62 @@ class SFTPackDataset(Dataset):
         self.packed_data = []
         self.num_skip_data = 0
         self.rng = random.Random(random_seed)
+        self.logger = get_logger()
+        self.num_tokenize_workers = num_tokenize_workers
 
     async def lazy_init(self):
-        tasks = []
+        sample_infos = []
+        for file_idx, file_path in enumerate(self.file_paths):
+            sample_infos.extend((file_idx, offset) for offset in self.get_offsets(file_path))
 
-        for file_path in self.file_paths:
-            tasks.append(analyze_jsonl_file(file_path, self.tokenizer, self.chat_template))
+        if not sample_infos:
+            self.packed_data = []
+            self.num_skip_data = 0
+            return
+        if not ray.is_initialized():
+            ray.init()
+        if self.num_tokenize_workers == -1:
+            num_cpu = int(ray.cluster_resources()["CPU"])
+            num_workers = max(1, num_cpu // 2, num_cpu - 16)
+        else:
+            num_workers = self.num_tokenize_workers
+        num_workers = min(num_workers, max(1, len(sample_infos) // 1000))
+        num_samples_per_worker = (len(sample_infos) + num_workers - 1) // num_workers
 
-        results = await asyncio.gather(*tasks)
-        for file_idx, (file_offsets, file_num_tokens) in enumerate(results):
-            # Oversample (ratio >= 1 repeats every line ``full`` times) and/or
-            # subsample the fractional remainder, e.g. ratio=2.5 -> all lines
-            # twice + a random 50%. ``selected`` holds indices into file_offsets.
-            n = len(file_offsets)
+        remote_count_tokens = ray.remote(self.count_tokens)
+        file_paths_ref = ray.put(self.file_paths)
+        tokenizer_ref = ray.put(self.tokenizer)
+        chat_template_ref = ray.put(self.chat_template)
+        futures = []
+        try:
+            for start_idx in range(0, len(sample_infos), num_samples_per_worker):
+                worker_sample_infos = sample_infos[start_idx : start_idx + num_samples_per_worker]
+                futures.append(
+                    remote_count_tokens.remote(
+                        worker_sample_infos,
+                        file_paths_ref,
+                        tokenizer_ref,
+                        chat_template_ref,
+                    )
+                )
+            self.logger.info(
+                f"Starting token counting for {len(sample_infos)} samples with {num_workers} workers",
+            )
+
+            counted_samples = [[] for _ in self.file_paths]
+            for worker_results in await asyncio.gather(*futures):
+                for sample in worker_results:
+                    counted_samples[sample[0]].append(sample)
+        finally:
+            for future in futures:
+                ray.cancel(future, force=True)
+
+        for file_idx, samples in enumerate(counted_samples):
             ratio = self.sample_ratios[file_idx]
             full = int(ratio)
-            selected = list(range(n)) * full + self.rng.sample(range(n), k=int(n * (ratio - full)))
-            for i in selected:
-                offset = file_offsets[i]
-                num_token = file_num_tokens[i]
-                self.data.append((file_idx, offset, num_token))
+            selected = list(range(len(samples))) * full
+            selected.extend(self.rng.sample(range(len(samples)), k=int(len(samples) * (ratio - full))))
+            self.data.extend(samples[index] for index in selected)
 
         self.packed_data, self.num_skip_data = self.pack_data(self.data, self.max_length)
 
@@ -135,14 +162,67 @@ class SFTPackDataset(Dataset):
 
         return packed_data, num_skip
 
+    @classmethod
+    def get_offsets(cls, file_path):
+        offsets = []
+        with open(file_path, "rb") as f:
+            while True:
+                offset = f.tell()
+                if not f.readline():
+                    break
+                offsets.append(offset)
+        return offsets
+
+    @staticmethod
+    def count_tokens(
+        samples,
+        file_paths,
+        tokenizer,
+        chat_template,
+    ):
+
+        if samples[0][0] == 0 and samples[0][1] == 0:
+            bar = tqdm.tqdm(total=len(samples), mininterval=10)
+        else:
+            bar = None
+        results = []
+        previous_file_index = -1
+        file_handle = None
+        try:
+            for file_index, offset in samples:
+                if previous_file_index != file_index:
+                    if file_handle:
+                        file_handle.close()
+                    file_handle = open(file_paths[file_index], "rb")  # noqa: SIM115
+                    previous_file_index = file_index
+                file_handle.seek(offset)
+                line = file_handle.readline()
+                messages = orjson.loads(line)["messages"]
+                num_tokens = count_sft_sample(messages, tokenizer, chat_template)
+                results.append((file_index, offset, num_tokens))
+                if bar:
+                    bar.update(1)
+        finally:
+            if file_handle:
+                file_handle.close()
+        return results
+
 
 class SFTPackDatasetConfig(BaseModel):
     file_paths: list[str]
     sample_ratios: list[float]
     max_length: int
     chat_template: Callable[..., str] | None = None
+    num_tokenize_workers: int = -1
 
     async def build(self, tokenizer) -> SFTPackDataset:
-        dataset = SFTPackDataset(self.file_paths, self.sample_ratios, tokenizer, self.chat_template, self.max_length)
+        dataset = SFTPackDataset(
+            self.file_paths,
+            self.sample_ratios,
+            tokenizer,
+            self.chat_template,
+            self.max_length,
+            num_tokenize_workers=self.num_tokenize_workers,
+        )
         await dataset.lazy_init()
         return dataset

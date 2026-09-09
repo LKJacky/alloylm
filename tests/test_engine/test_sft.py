@@ -5,13 +5,14 @@ import os
 import shutil
 import tempfile
 import unittest
+from pathlib import Path
 
 import aiofiles
 import torch
 from torch import distributed as dist
 from transformers import AutoTokenizer
 
-from alloylm.algorithm.sft.dataset import SFTPackDatasetConfig
+from alloylm.algorithm.sft.dataset import SFTPackDataset, SFTPackDatasetConfig
 from alloylm.algorithm.sft.sft_algo import SFTAlgorithmConfig, SFTTrainer
 from alloylm.engine.infer_engine.engine import InferEngineConfig
 from alloylm.engine.model import AlloyLMModelConfig
@@ -43,6 +44,38 @@ def chat_template(converted_messages, add_generation_prompt=False):
     if add_generation_prompt:
         text += "<|im_start|>assistant\n"
     return text
+
+
+class CharacterTokenizer:
+    def encode(self, text, add_special_tokens=False):
+        return list(text)
+
+
+def render_messages(messages, add_generation_prompt=False):
+    return "".join(message["content"] for message in messages)
+
+
+class TestSFTPackDataset(unittest.IsolatedAsyncioTestCase):
+    async def test_ray_token_counting_preserves_samples_and_ratio(self):
+        records = [
+            {"messages": [{"role": "user", "content": "a"}]},
+            {"messages": [{"role": "user", "content": "bb"}]},
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "data.jsonl"
+            path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+            dataset = SFTPackDataset(
+                [str(path)],
+                [2.0],
+                CharacterTokenizer(),
+                render_messages,
+                max_length=100,
+                num_tokenize_workers=2,
+            )
+            await dataset.lazy_init()
+
+        self.assertEqual([item[2] for item in dataset.data], [1, 2, 1, 2])
+        self.assertEqual(len(dataset.data), 4)
 
 
 class SFTDatasetTest(unittest.TestCase):
