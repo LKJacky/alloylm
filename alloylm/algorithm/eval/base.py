@@ -24,9 +24,9 @@ def load_jsonl(path: str) -> list[dict]:
     return data
 
 
-async def save_to_file(queue: asyncio.Queue, file_path: str):
+async def save_to_file(queue: asyncio.Queue, file_path: str, create_new=False):
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    if os.path.exists(file_path):
+    if create_new and os.path.exists(file_path):
         shutil.move(file_path, file_path + ".bak")
     cached = []
     last_save_time = time.time()
@@ -90,6 +90,7 @@ class EvalRunner:
         running_futures,
         future_to_dataset,
         resumed,
+        ds_results,
     ):
         try:
             for dataset in self.datasets:
@@ -100,10 +101,13 @@ class EvalRunner:
                         if item.task_data.id in ds_resumed:
                             task_data = ds_resumed[item.task_data.id]
                             task_data.infer_args = item.task_data.infer_args
-                            item = TaskItem(task_cls=item.task_cls, task_data=task_data)
-                        future = asyncio.create_task(self._run_eval_item(item))
-                        running_futures.add(future)
-                        future_to_dataset[future] = dataset.config.name
+                            ds_results[dataset.config.name].append(task_data)
+                            semaphore.release()
+                            continue
+                        else:
+                            future = asyncio.create_task(self._run_eval_item(item))
+                            running_futures.add(future)
+                            future_to_dataset[future] = dataset.config.name
                     except BaseException:
                         semaphore.release()
                         raise
@@ -128,9 +132,13 @@ class EvalRunner:
             tqdm_bars[name] = tqdm.tqdm(total=len(dataset), desc=name)
             save_queues[name] = asyncio.Queue()
             save_path = os.path.join(self.work_dir, f"{name}.jsonl")
-            dump_tasks.append(asyncio.create_task(save_to_file(save_queues[name], save_path)))
+            dump_tasks.append(
+                asyncio.create_task(save_to_file(save_queues[name], save_path, create_new=not self.resume_enabled))
+            )
 
-        produce_task = asyncio.create_task(self.produce(semaphore, running_futures, future_to_dataset, resumed))
+        produce_task = asyncio.create_task(
+            self.produce(semaphore, running_futures, future_to_dataset, resumed, ds_results)
+        )
         results = []
         try:
             while not produce_task.done() or running_futures:
