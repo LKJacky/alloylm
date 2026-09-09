@@ -1,8 +1,10 @@
 import asyncio
 import os
+import tempfile
 import unittest
+from types import SimpleNamespace
 
-from alloylm.algorithm.base import InferArgs
+from alloylm.algorithm.base import Dataset, InferArgs, Task, TaskData, TaskItem
 from alloylm.algorithm.eval.base import EvalConfig, EvalRunner, run_eval
 from alloylm.impl.math import GSM8KDatasetConfig, GSM8KTask
 from alloylm.test_utils import (
@@ -166,3 +168,42 @@ class TestSglangTask(CudaAsyncTestCase):
                     resume=False,
                 )
             )
+
+
+class SuccessfulTask(Task):
+    @classmethod
+    async def infer(cls, task_data):
+        task_data.finish_reason = "stop"
+        return task_data
+
+    @classmethod
+    async def eval(cls, task_data):
+        task_data.metric = 1.0
+        return task_data
+
+
+class BrokenDataset(Dataset):
+    def __init__(self):
+        self.config = SimpleNamespace(name="broken")
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, index):
+        if index == 0:
+            return TaskItem(task_cls=SuccessfulTask, task_data=TaskData(id="0", messages=[]))
+        raise RuntimeError("dataset iteration failed")
+
+
+class TestEvalRunner(unittest.IsolatedAsyncioTestCase):
+    async def test_producer_failure_does_not_hang(self):
+        semaphore = asyncio.Semaphore(1)
+        with tempfile.TemporaryDirectory() as work_dir:
+            result = await asyncio.wait_for(EvalRunner(BrokenDataset(), work_dir=work_dir).run(semaphore), timeout=30)
+        self.assertEqual(result.metric, 1.0)
+        await asyncio.wait_for(semaphore.acquire(), timeout=1)
+
+    async def test_rejects_zero_concurrency(self):
+        config = EvalConfig(datasets=[], concurrency=0)
+        with self.assertRaisesRegex(ValueError, "concurrency must be greater than zero"):
+            await run_eval(config)
