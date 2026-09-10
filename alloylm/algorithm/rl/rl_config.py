@@ -61,6 +61,7 @@ class UnifiedConfig(BaseModel):
     sp_size: int = 1
     freeze_routers: bool = True
     max_prefill_length: int = 8 * 1024
+    sampler_batch_size: int = 128
 
 
 def create_trainer(
@@ -90,6 +91,7 @@ def create_trainer(
                 memory_usage=config.cache_max_entry_count,
                 chat_template=config.chat_template,
                 tool_pattern=config.tool_pattern,
+                sampler_batch_size=config.sampler_batch_size,
             ),
         ),
         datasets=config.train_datasets,

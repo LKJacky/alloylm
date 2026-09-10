@@ -5,7 +5,7 @@ from torch import distributed as dist
 
 
 class BatchSampler:
-    def __init__(self, real_vocab_size=-1):
+    def __init__(self, real_vocab_size=-1, sample_batch_size=128):
         self.real_vocab_size = real_vocab_size
 
         self.random_generator = torch.Generator(device="cuda")
@@ -13,10 +13,11 @@ class BatchSampler:
             self.random_generator.manual_seed(dist.get_rank() * 100)
         else:
             self.random_generator.manual_seed(0)
+        self.sample_batch_size = sample_batch_size
 
     @torch.inference_mode()
     def batch_sample(self, batch_logits: Tensor, temperature: Tensor, top_k: Tensor, top_p: Tensor):
-        sample_batch_size = 512
+        sample_batch_size = self.sample_batch_size
         tokens = []
         log_probs = []
         entropy = []
@@ -55,9 +56,6 @@ class BatchSampler:
 
         return: sampled: [B]
         """
-
-        B, D = logits.shape
-
         # argmax sample
         if top_k.eq(1).all():
             return torch.argmax(logits, dim=-1).flatten()

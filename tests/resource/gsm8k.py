@@ -1,24 +1,41 @@
 import datetime
 import os
 
+import torch
+
 from alloylm.algorithm.base import InferArgs
 from alloylm.algorithm.rl.rl_config import UnifiedConfig, create_trainer
-from alloylm.engine.train_engine.hack_client import (
-    HighConcurrentClient as AsyncClient,
-)
-from alloylm.impl import common
+from alloylm.engine.model import AlloyLMModelConfig
+from alloylm.engine.train_engine.utils import FSDPConfig
+from alloylm.impl.engines.qwen.qwen2_modeling2 import FSDPQwen2ForCausalLM
 from alloylm.impl.math import GSM8KDatasetConfig
 
-common.AsyncClient = AsyncClient
-
-
 INFER_LENGTH = 4096
+NUM_WORKERS = int(os.environ.get("GPU", "4"))
+SP_SIZE = 2 if NUM_WORKERS % 2 == 0 else 1
 
 
 def get_trainer():
     trainer = create_trainer(
         UnifiedConfig(
-            llm="Qwen/Qwen2.5-0.5B-Instruct",
+            llm_config=AlloyLMModelConfig(
+                path="Qwen/Qwen2.5-0.5B-Instruct",
+                model_cls=FSDPQwen2ForCausalLM,
+                fsdp_config=FSDPConfig(
+                    train_mesh={
+                        "mesh_shape": (NUM_WORKERS // SP_SIZE, SP_SIZE),
+                        "mesh_dim_names": ["dp", "sp"],
+                        "device_type": "cuda",
+                    },
+                    infer_mesh={
+                        "mesh_shape": (NUM_WORKERS, 1),
+                        "mesh_dim_names": ["dp", "tp"],
+                        "device_type": "cuda",
+                    },
+                    lm_head_dtype=torch.bfloat16,
+                    shard_dtype=torch.bfloat16,
+                ),
+            ),
             max_length_rollout=2048 + INFER_LENGTH,
             max_length_train=8192,
             # data
@@ -26,7 +43,16 @@ def get_trainer():
                 GSM8KDatasetConfig(
                     name="gsm8k_1",
                     split="train",
-                    infer_args=InferArgs(sample_args={"top_p": 1.0, "temperature": 1.0, "max_tokens": INFER_LENGTH}),
+                    infer_args=InferArgs(
+                        sample_args={
+                            "top_p": 1.0,
+                            "temperature": 1.0,
+                            "max_tokens": INFER_LENGTH,
+                            "extra_body": {
+                                "for_training": True,
+                            },
+                        }
+                    ),
                 )
             ],
             train_sample_ratios=[1.0],
@@ -52,11 +78,12 @@ def get_trainer():
             auto_resume=True,
             # infra
             work_dir=f"work_dirs/tests/debug_gsm8k/{datetime.datetime.now(tz=datetime.UTC).strftime('%Y-%m-%d')}_{os.environ.get('WORKER_NAME', 'default')}",
-            num_workers=int(os.environ.get("GPU", "4")),
+            num_workers=NUM_WORKERS,
             max_concurrency_per_node=512,
-            cache_max_entry_count=0.8,
+            cache_max_entry_count=0.4,
             max_prefill_length=8192,
-            sp_size=min(int(os.environ.get("GPU", "4")), 2),
+            sp_size=SP_SIZE,
+            sampler_batch_size=16,
         )
     )
     return trainer

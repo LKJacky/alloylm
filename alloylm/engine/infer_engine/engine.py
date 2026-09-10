@@ -25,6 +25,7 @@ class InferEngineConfig(PydanticBaseModel):
     memory_usage: float = 0.8
     chat_template: object | None = None
     max_prefill_length: int = 16 * 1024
+    sampler_batch_size: int = 64
     port: int | None = None
     proxy_url: str | None = None
 
@@ -53,6 +54,7 @@ class InferEngine:
             max_prefill_length=engine_config.max_prefill_length,
             task_queue=task_queue,
             real_vocab_size=real_vocab_size,
+            sampler_batch_size=engine_config.sampler_batch_size,
         )
 
         if engine_config.port is None:

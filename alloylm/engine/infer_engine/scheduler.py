@@ -161,6 +161,7 @@ class SchedulerServer:
         max_prefill_length: int,
         task_queue: Queue[GeneConfig],
         real_vocab_size=-1,
+        sampler_batch_size: int = 128,
     ):
         self.model = model
         self.cache = cache
@@ -176,7 +177,7 @@ class SchedulerServer:
         )
         self.decode_queue: list[InferItem] = []
 
-        self.batch_sampler = BatchSampler(real_vocab_size=real_vocab_size)
+        self.batch_sampler = BatchSampler(real_vocab_size=real_vocab_size, sample_batch_size=sampler_batch_size)
         self.device_sessions: dict[int, DeviceSession] = {}
 
         self.fowarded_sample_config = set()
