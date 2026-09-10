@@ -94,6 +94,7 @@ class TaskData(BaseModel):
 
     # message
     messages: list[dict]
+    tools: list[dict] | None = None
     finish_reason: str = ""
 
     # tokens
