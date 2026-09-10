@@ -8,7 +8,10 @@ import tqdm
 from pydantic import BaseModel
 from torch.utils.data import Dataset
 
-from alloylm.engine.train_engine.dataset import tokenize_messages
+from alloylm.engine.train_engine.dataset import (
+    distangle_train_or_not_train,
+    tokenize_messages,
+)
 from alloylm.utils import get_logger, init_ray
 
 logger = get_logger()
@@ -185,6 +188,20 @@ class SFTPackDataset(Dataset):
             if file_handle:
                 file_handle.close()
         return results
+
+    def get_formated_message_sample(self):
+        file_index, offset, _ = self.data[0]
+        with open(self.file_paths[file_index], "rb") as f:
+            f.seek(offset)
+            line = f.readline()
+        messages = orjson.loads(line)["messages"]
+        content = ""
+        for item, compute_loss in distangle_train_or_not_train(messages, self.chat_template):
+            if compute_loss:
+                content += f"<loss>{item}</loss>"
+            else:
+                content += item
+        return content
 
 
 class SFTPackDatasetConfig(BaseModel):

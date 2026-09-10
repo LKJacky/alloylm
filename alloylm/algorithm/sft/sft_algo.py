@@ -129,7 +129,7 @@ class SFTTrainer:
         self.jsonl_paths = []
         self.packs = []
         num_skip = 0
-        for cfg in self.config.datasets:
+        for i, cfg in enumerate(self.config.datasets):
             cfg.max_length = self.config.max_length
             dataset = await cfg.build(self.tokenizer, self.chat_template)
             num_skip += dataset.num_skip_data
@@ -143,6 +143,10 @@ class SFTTrainer:
                         num_tokens=[dataset.data[i][2] for i in pack],
                     )
                 )
+            # dump data sample
+            sample = dataset.get_formated_message_sample()
+            async with aiofiles.open(self.config.work_dir + f"/dataset_{i}_sample.txt", "w") as f:
+                await f.write(sample)
 
         assert len(self.packs) > 0, "SFT datasets produced 0 packs; check file_paths / sample_ratios / max_length."
         self.steps_per_epoch = len(self.packs) // self.config.global_batch_size

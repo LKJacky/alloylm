@@ -12,26 +12,27 @@ from torch.utils.data import ConcatDataset, Dataset
 from transformers import AutoTokenizer
 
 
-def tokenize_messages(messages, chat_template, tokenizer):
+def distangle_train_or_not_train(messages: list[dict], chat_template):
+    # distinguish between has loss or not.
+    converted_messages = []
+    pre_text = ""
+    render = chat_template.render if hasattr(chat_template, "render") else chat_template
+    for i, message in enumerate(messages):
+        if i + 1 < len(messages) and messages[i + 1]["role"] == "assistant":
+            add_generation_prompt = True
+        else:
+            add_generation_prompt = False
+        text = render(messages=messages[: i + 1], add_generation_prompt=add_generation_prompt)
+        if message["role"] == "assistant":
+            has_loss = True
+        else:
+            has_loss = False
+        converted_messages.append((text[len(pre_text) :], has_loss))  # Append only the new part of the text
+        pre_text = text
+    return converted_messages
 
-    def distangle_train_or_not_train(messages: list[dict], chat_template):
-        # distinguish between has loss or not.
-        converted_messages = []
-        pre_text = ""
-        render = chat_template.render if hasattr(chat_template, "render") else chat_template
-        for i, message in enumerate(messages):
-            if i + 1 < len(messages) and messages[i + 1]["role"] == "assistant":
-                add_generation_prompt = True
-            else:
-                add_generation_prompt = False
-            text = render(messages=messages[: i + 1], add_generation_prompt=add_generation_prompt)
-            if message["role"] == "assistant":
-                has_loss = True
-            else:
-                has_loss = False
-            converted_messages.append((text[len(pre_text) :], has_loss))  # Append only the new part of the text
-            pre_text = text
-        return converted_messages
+
+def tokenize_messages(messages, chat_template, tokenizer):
 
     def tokenize(converted_messages: list[(str, bool)], tokenizer):
         input_ids = []
