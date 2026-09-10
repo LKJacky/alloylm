@@ -215,3 +215,7 @@ class AlloyLMModel(ABC):
     @abstractmethod
     def train_forward(self, input: TrainInput) -> Tensor:
         pass
+
+    @abstractmethod
+    def compute_flops(self, seqlens: list[int]) -> int:
+        pass

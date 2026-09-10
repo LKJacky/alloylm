@@ -756,6 +756,52 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
             (input_ids, position_ids), kwargs = self.prepare_train_args(input_ids, position_ids, **kwargs)
         return super().forward(input_ids=input_ids, position_ids=position_ids, **kwargs)
 
+    def compute_flops(self, seqlens: list[int]) -> int:
+        """Estimate forward-and-backward FLOPs for a packed training batch.
+
+        Counts multiply-adds in linear layers and causal attention as two FLOPs. Elementwise operations, embeddings,
+        normalization, and optimizer updates are intentionally excluded.
+        """
+        if any(seqlen < 0 for seqlen in seqlens):
+            raise ValueError("sequence lengths must be non-negative")
+
+        config = self.config
+        num_tokens = sum(seqlens)
+        hidden_size = config.hidden_size
+        head_dim = getattr(config, "head_dim", None) or hidden_size // config.num_attention_heads
+        query_size = config.num_attention_heads * head_dim
+        key_value_size = config.num_key_value_heads * head_dim
+
+        # Q/K/V and output projections. The factor of six accounts for the
+        # multiply-adds in the forward pass and both backward-pass matmuls.
+        attention_weights = 2 * hidden_size * (query_size + key_value_size)
+        if isinstance(config, Qwen3MoeConfig):
+            router_weights = hidden_size * config.num_experts
+            active_expert_weights = 3 * hidden_size * config.moe_intermediate_size * config.num_experts_per_tok
+            layer_weights = attention_weights + router_weights + active_expert_weights
+        else:
+            layer_weights = attention_weights + 3 * hidden_size * config.intermediate_size
+
+        linear_flops = 6 * num_tokens * (config.num_hidden_layers * layer_weights + hidden_size * config.vocab_size)
+
+        # Flash attention only evaluates the causal region. Sliding-attention
+        # layers additionally cap the number of attended keys per query.
+        layer_types = getattr(config, "layer_types", ["full_attention"] * config.num_hidden_layers)
+        attention_flops = 0
+        for layer_idx in range(config.num_hidden_layers):
+            window = config.sliding_window if layer_types[layer_idx] == "sliding_attention" else None
+            attended_pairs = 0
+            for seqlen in seqlens:
+                if window is None or seqlen <= window:
+                    attended_pairs += seqlen * (seqlen + 1) // 2
+                else:
+                    attended_pairs += window * seqlen - window * (window - 1) // 2
+            # QK^T and AV each perform a multiply-add per attended pair;
+            # backward costs twice their combined forward cost.
+            attention_flops += 12 * query_size * attended_pairs
+
+        return linear_flops + attention_flops
+
     # for hf checkpoint loading
 
     @classmethod
