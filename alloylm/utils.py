@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import Lock
 
 import orjson
+import ray
 
 
 def dispatch_triton():
@@ -205,3 +206,21 @@ class MeasureTime:
             return s
 
         return _format(self, "")
+
+
+# ray
+
+
+def init_ray():
+    if not ray.is_initialized():
+        try:
+            ray.init(address="auto")
+        except BaseException:  # noqa
+            ray.init(
+                ignore_reinit_error=True,
+                include_dashboard=False,
+                _system_config={
+                    "prestart_worker_first_driver": False,
+                    "enable_worker_prestart": False,
+                },
+            )

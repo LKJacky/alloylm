@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from torch.utils.data import Dataset
 
 from alloylm.engine.train_engine.dataset import tokenize_messages
-from alloylm.utils import get_logger
+from alloylm.utils import get_logger, init_ray
 
 logger = get_logger()
 
@@ -35,6 +35,7 @@ class SFTPackDataset(Dataset):
         self.num_tokenize_workers = num_tokenize_workers
 
     async def lazy_init(self):
+        init_ray()
         sample_infos = []
         for file_idx, file_path in enumerate(self.file_paths):
             sample_infos.extend((file_idx, offset) for offset in self.get_offsets(file_path))
@@ -43,8 +44,6 @@ class SFTPackDataset(Dataset):
             self.packed_data = []
             self.num_skip_data = 0
             return
-        if not ray.is_initialized():
-            ray.init()
         if self.num_tokenize_workers == -1:
             num_cpu = int(ray.cluster_resources()["CPU"])
             num_workers = max(1, num_cpu // 2, num_cpu - 16)

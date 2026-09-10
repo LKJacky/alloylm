@@ -9,7 +9,7 @@ import torch
 from pydantic import BaseModel as PydanticBaseModel
 from torch import distributed as dist
 
-from alloylm.utils import get_free_port
+from alloylm.utils import get_free_port, init_ray
 
 
 async def run_by_func_name(self, method, args, kwargs):
@@ -86,11 +86,11 @@ class SPMDActor:
         if module is not None:
             try:
                 ray.cloudpickle.register_pickle_by_value(module)
-            except Exception:
+            except Exception:  # noqa
                 pass
 
-        if not ray.is_initialized():
-            ray.init(ignore_reinit_error=True, include_dashboard=False)
+        init_ray()
+
         master_addr = "127.0.0.1"
         master_port = get_free_port()
         self._workers = []
