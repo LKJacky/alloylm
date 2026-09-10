@@ -2,6 +2,8 @@ import json
 import os
 import random
 import shutil
+import time
+from datetime import timedelta
 from typing import Any
 
 import aiofiles
@@ -175,7 +177,9 @@ class SFTTrainer:
 
     async def fit(self):
         epoch = -1
-        for step in range(self.cur_step, self.config.total_training_steps):
+        t0 = time.time()
+        start_step = self.cur_step
+        for step in range(start_step, self.config.total_training_steps):
             with MeasureTime("step_time") as timer:
                 self.cur_step = step
 
@@ -210,8 +214,13 @@ class SFTTrainer:
             global_tokens = train_log["num_tokens"] / self.sp_size
             train_log["tgs"] = int(global_tokens / train_time / self.dp_size / self.sp_size)
 
+            elapsed_time = time.time() - t0
+            completed_steps = step - start_step + 1
+            remaining_steps = self.config.total_training_steps - step - 1
+            eta = timedelta(seconds=round(elapsed_time / completed_steps * remaining_steps))
+
             log_str = ", ".join(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in train_log.items())
-            self.logger.info(f"**SFT training step {step} logs: {log_str}")
+            self.logger.info(f"**SFT training step {step} logs: {log_str}, ETA: {eta}")
             for k, v in train_log.items():
                 self.tb_writer.add_scalar(f"sft/{k}", v, step)
             self.tb_writer.add_scalar("sft/epoch", epoch, step)
