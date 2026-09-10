@@ -16,7 +16,6 @@ from torch.distributed._composable.fsdp import (
 )
 from torch.distributed._functional_collectives import (
     all_to_all_single,
-    all_to_all_single_autograd,
 )
 from torch.distributed._tensor import DTensor
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -68,28 +67,24 @@ def all_to_all(
     input: torch.Tensor, scatter_dim: int, gather_dim: int, mesh: DeviceMesh, training=True
 ) -> torch.Tensor:
     world_size = mesh.size()
-    split_size = input.size(scatter_dim) // world_size
+    scatter_size = input.size(scatter_dim)
+    assert scatter_size % world_size == 0, (
+        f"Dimension {scatter_dim} ({scatter_size}) must be divisible by the sequence parallel size ({world_size})"
+    )
+    split_size = scatter_size // world_size
     input_split_sizes = [split_size] * world_size
     output_split_sizes = input_split_sizes
 
-    input = input.contiguous()
-    input = input.movedim(scatter_dim, 0)
-    if training:
-        all_to_all_function = all_to_all_single_autograd
-    else:
-        all_to_all_function = all_to_all_single
+    input = input.movedim(scatter_dim, 0).contiguous()
 
-    output = all_to_all_function(
+    output = all_to_all_single(  # all_to_all_single has support autograd in latest torch
         input,
         group=mesh.get_group(),
         input_split_sizes=input_split_sizes,
         output_split_sizes=output_split_sizes,
     )
-    output = output.transpose(0, scatter_dim)
-
-    output_list = [t for t in torch.tensor_split(output, world_size, scatter_dim)]
-    output = torch.cat(output_list, dim=gather_dim).contiguous()
-    return output
+    output_chunks = [chunk.movedim(0, scatter_dim) for chunk in output.split(split_size, dim=0)]
+    return torch.cat(output_chunks, dim=gather_dim).contiguous()
 
 
 class DisableGcGollect:
@@ -186,20 +181,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """This is the equivalent of torch.repeat_interleave(x, dim=1,
-    repeats=n_rep).
-
-    The hidden states go from (batch, num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen,
-    head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 class QwenRMSNorm(nn.Module):
@@ -328,7 +309,7 @@ class Qwen2Attention(nn.Module):
 
     def forward_training(
         self: "Qwen2Attention",
-        query_states: torch.Tensor,
+        query_states: torch.Tensor,  # batch, seqlen, num_heads, head_dim
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         cu_seq_lens_q: torch.Tensor,
@@ -346,24 +327,26 @@ class Qwen2Attention(nn.Module):
             window_size = (self.config.sliding_window - 1, self.config.sliding_window - 1)
         else:
             window_size = (None, None)
-
         if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
-            raise NotImplementedError("Sequence parallelism is not supported in training mode yet.")
+            # sp, each rank compute only a part of heads
             sp_size = sequence_parallel_mesh.size()
-            num_kv_heads = key_states.size(1)
+            num_kv_heads = key_states.size(2)
             if sp_size > num_kv_heads:
                 assert sp_size % num_kv_heads == 0
-                key_states = repeat_kv(key_states, sp_size // num_kv_heads)
-                value_states = repeat_kv(value_states, sp_size // num_kv_heads)
+                repeats = sp_size // num_kv_heads
+                key_states = torch.repeat_interleave(key_states, repeats, dim=2)
+                value_states = torch.repeat_interleave(value_states, repeats, dim=2)
+            else:
+                assert num_kv_heads % sp_size == 0
 
             query_states = all_to_all(
-                query_states, scatter_dim=1, gather_dim=2, mesh=sequence_parallel_mesh, training=self.training
+                query_states, scatter_dim=2, gather_dim=1, mesh=sequence_parallel_mesh, training=self.training
             )
             key_states = all_to_all(
-                key_states, scatter_dim=1, gather_dim=2, mesh=sequence_parallel_mesh, training=self.training
+                key_states, scatter_dim=2, gather_dim=1, mesh=sequence_parallel_mesh, training=self.training
             )
             value_states = all_to_all(
-                value_states, scatter_dim=1, gather_dim=2, mesh=sequence_parallel_mesh, training=self.training
+                value_states, scatter_dim=2, gather_dim=1, mesh=sequence_parallel_mesh, training=self.training
             )
 
         # (bs, n , qh // sp, d)
@@ -382,7 +365,7 @@ class Qwen2Attention(nn.Module):
         )
         if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
             attn_output = all_to_all(
-                attn_output, scatter_dim=1, gather_dim=2, mesh=sequence_parallel_mesh, training=self.training
+                attn_output, scatter_dim=0, gather_dim=1, mesh=sequence_parallel_mesh, training=self.training
             )
 
         return attn_output, None
@@ -677,6 +660,9 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
         sequence_parallel_mesh=None,
         **kwargs,
     ):
+        if sequence_parallel_mesh is None:
+            sequence_parallel_mesh = self.fsdp_config.train_mesh["sp"]
+
         _input_ids = input_ids
         _position_ids = position_ids
         if cu_seq_lens_q is None:

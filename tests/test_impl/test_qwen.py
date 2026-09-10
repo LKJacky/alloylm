@@ -5,7 +5,7 @@ import unittest
 import torch
 from transformers import AutoTokenizer
 
-from alloylm.engine.spmd import init_dist
+from alloylm.engine.spmd import SPMDActor, SPMDActorConfig, init_dist
 from alloylm.impl.engines.qwen import Qwen3ChatTemplate
 from alloylm.impl.engines.qwen.qwen2_modeling2 import (
     FSDPConfig,
@@ -13,6 +13,51 @@ from alloylm.impl.engines.qwen.qwen2_modeling2 import (
 )
 from alloylm.impl.engines.qwen.swa_cache import SwaCacheManager
 from alloylm.test_utils import CudaAsyncTestCase, collect_garbage
+
+
+class SequenceParallelModel:
+    def __init__(self, model_path, world_size):
+        self.model = FSDPQwen2ForCausalLM.from_pretrained(
+            model_path,
+            fsdp_config=FSDPConfig(
+                train_mesh={
+                    "device_type": "cuda",
+                    "mesh_shape": (1, world_size),
+                    "mesh_dim_names": ["fsdp", "sp"],
+                },
+                infer_mesh={
+                    "device_type": "cuda",
+                    "mesh_shape": (1, world_size),
+                    "mesh_dim_names": ["dp", "tp"],
+                },
+                lm_head_dtype=torch.bfloat16,
+            ),
+        )
+        self.model.train()
+
+    def forward(self):
+        input_ids = torch.tensor([[1, 2, 3, 4]], device="cuda")
+        position_ids = torch.arange(input_ids.shape[1], device="cuda").unsqueeze(0)
+        train_mesh = self.model.fsdp_config.train_mesh
+
+        with torch.no_grad():
+            self.model.fsdp_config.train_mesh = {"sp": train_mesh["fsdp"]}
+            sp1_logits = self.model(input_ids, position_ids=position_ids)
+
+            self.model.fsdp_config.train_mesh = train_mesh
+            local_logits = self.model(input_ids, position_ids=position_ids)
+            gathered_logits = [torch.empty_like(local_logits) for _ in range(torch.distributed.get_world_size())]
+            torch.distributed.all_gather(gathered_logits, local_logits)
+            sp2_logits = torch.cat(gathered_logits, dim=1)
+
+        torch.testing.assert_close(sp2_logits.float(), sp1_logits.float(), atol=0.5, rtol=0.02)
+        return tuple(sp2_logits.shape)
+
+    def close(self):
+        self.model.to_empty(device="cpu")
+        del self.model
+        collect_garbage()
+        torch.distributed.destroy_process_group()
 
 
 class TestQwenModel(CudaAsyncTestCase):
@@ -199,6 +244,21 @@ class TestQwenModel(CudaAsyncTestCase):
             del cache
             self.model.train_shard()
             collect_garbage()
+
+    @unittest.skipUnless(torch.cuda.device_count() > 1, "SP test requires more than 1 CUDA device")
+    async def test_forward_sp(self):
+        world_size = 2
+        model = SPMDActor.create_spmd_actor(
+            SequenceParallelModel,
+            args=(self.model_path, world_size),
+            spmd_config=SPMDActorConfig(world_size=world_size, num_gpus=1),
+        )
+        try:
+            output_shapes = await model.forward()
+            self.assertEqual(output_shapes, [(1, 4, self.model.config.vocab_size)] * world_size)
+            await model.close()
+        finally:
+            model.shutdown()
 
 
 class TestQwen3ChatTemplate(unittest.TestCase):
