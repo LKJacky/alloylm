@@ -48,6 +48,15 @@ class TrainInferEngine:
         model_config: AlloyLMModelConfig,
         engine_config: TrainInferEngineConfig,
     ):
+        self.logger = get_logger(
+            engine_logger_name(),
+            path=os.path.join(
+                engine_config.train_config.work_dir,
+                f"{engine_logger_name()}.log",
+            ),
+            output_to_stdout=False,
+            force_recreate=True,
+        )
         self.model = model_config.build()
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_config.path,
@@ -66,16 +75,6 @@ class TrainInferEngine:
             self.model,
             self.tokenizer,
             config=self.args.train_config,
-        )
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        self.logger = get_logger(
-            engine_logger_name(),
-            path=os.path.join(
-                engine_config.train_config.work_dir,
-                f"engine_rank{rank}.log",
-            ),
-            output_to_stdout=False,
-            force_recreate=True,
         )
 
     async def lazy_init(self):

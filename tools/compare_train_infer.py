@@ -24,11 +24,11 @@ import random
 
 import torch
 from matplotlib import pyplot as plt
-from mmengine.dist import init_dist
 from torch import distributed as dist
 from torch import nn
 from transformers import AutoTokenizer
 
+from alloylm.engine.spmd import init_dist
 from alloylm.impl.engines.qwen.qwen2_modeling2 import (
     FSDPQwen2ForCausalLM,
 )
@@ -51,7 +51,7 @@ def init_distributed():
         os.environ.setdefault("LOCAL_RANK", "0")
         os.environ.setdefault("MASTER_ADDR", "localhost")
         os.environ.setdefault("MASTER_PORT", str(random.randint(20000, 30000)))
-        init_dist("pytorch")
+        init_dist()
 
 
 def load_samples(path, max_samples=None):

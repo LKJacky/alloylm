@@ -1,6 +1,9 @@
 import gc
 import math
 import os
+import platform
+import random
+import sys
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -10,14 +13,12 @@ from datetime import timedelta
 from functools import partial
 from typing import Any, TypedDict
 
+import numpy as np
 import ray
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn.functional as F
 import transformers
-from mmengine import mkdir_or_exist
-from mmengine.runner import set_random_seed
-from mmengine.utils.dl_utils import collect_env
 from pydantic import BaseModel
 from torch import distributed as dist
 from torch.distributed.checkpoint.state_dict import (
@@ -55,6 +56,26 @@ class RLInput(TypedDict, total=False):
     messages: list[dict]
     advantages: float
     infer_info: ray.ObjectRef
+
+
+def set_random_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def collect_env():
+    return OrderedDict(
+        {
+            "Platform": platform.platform(),
+            "Python": sys.version.replace("\n", " "),
+            "PyTorch": torch.__version__,
+            "CUDA available": torch.cuda.is_available(),
+            "CUDA runtime": torch.version.cuda,
+            "transformers": transformers.__version__,
+        }
+    )
 
 
 # loss
@@ -257,7 +278,6 @@ class TrainEngine:
         # print env
         if self.rank == 0:
             env = collect_env()
-            env["Transformers"] = transformers.__version__
             runtime_env = OrderedDict()
             runtime_env.update(env)
             runtime_env["Seed"] = self.config.seed
@@ -854,7 +874,7 @@ class TrainEngine:
                 "optimizer": shard_optimizer_state_dict,
                 "train_state": self.train_state.state_dict(),
             }
-            mkdir_or_exist(ckpt_dir)
+            os.makedirs(ckpt_dir, exist_ok=True)
             self.ckpt_handle = dcp.async_save(state_dict, checkpoint_id=ckpt_dir, process_group=self.gloo_group)
             wait([self.ckpt_handle])
 

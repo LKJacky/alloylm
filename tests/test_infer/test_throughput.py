@@ -14,11 +14,11 @@ import traceback
 import unittest
 
 import torch
-from mmengine.dist import init_dist
 from torch import distributed as dist
 from transformers import AutoTokenizer
 
 from alloylm.engine.infer_engine.sampler import BatchSampler
+from alloylm.engine.spmd import init_dist
 from alloylm.impl.engines.qwen.qwen2_modeling2 import (
     FSDPConfig,
     FSDPQwen2ForCausalLM,
@@ -69,11 +69,8 @@ def has_other_cuda_programs():
             current_memory = torch.cuda.memory_allocated()
             max_memory = torch.cuda.get_device_properties(0).total_memory
             # Skip if more than 10% of GPU memory is already used
-            if current_memory / max_memory > 0.1:
-                return True
-            else:
-                return False
-        except Exception:
+            return current_memory / max_memory > 0.1
+        except Exception:  # noqa: BLE001
             return True
 
 
@@ -99,15 +96,15 @@ class TestThroughput(CudaAsyncTestCase):
             os.environ.setdefault("LOCAL_RANK", "0")
             os.environ.setdefault("MASTER_ADDR", "localhost")
             os.environ.setdefault("MASTER_PORT", str(random.randint(20000, 30000)))
-            init_dist("pytorch")
+            init_dist()
         with LoadWoInit():
             model = FSDPQwen2ForCausalLM.from_pretrained(
                 MODEL_PATH,
                 torch_dtype="bfloat16",
                 trust_remote_code=True,
                 fsdp_config=FSDPConfig(
-                    train_mesh=dict(device_type="cuda", mesh_shape=(1, 1), mesh_dim_names=["fsdp", "sp"]),
-                    infer_mesh=dict(device_type="cuda", mesh_shape=(1, 1), mesh_dim_names=["dp", "tp"]),
+                    train_mesh={"device_type": "cuda", "mesh_shape": (1, 1), "mesh_dim_names": ["fsdp", "sp"]},
+                    infer_mesh={"device_type": "cuda", "mesh_shape": (1, 1), "mesh_dim_names": ["dp", "tp"]},
                     lm_head_dtype=torch.bfloat16,
                 ),
             ).cuda()
@@ -299,7 +296,7 @@ class TestThroughput(CudaAsyncTestCase):
             try:
                 throughput, median_ms = self._bench_prefill(batch_size, seq_len)
                 print(f"{batch_size:>6} {seq_len:>8} {total:>8} {median_ms:>12.2f} {throughput:>14,.0f}")
-            except Exception as e:
+            except Exception as e:  # noqa
                 print(f"{batch_size:>6} {seq_len:>8} {total:>8} {'SKIP':>12} {str(e)[:30]}")
         print("=" * 70)
 
@@ -324,7 +321,7 @@ class TestThroughput(CudaAsyncTestCase):
                 if batch_size <= self.cache.max_infer_batch_size:
                     throughput, elapsed_ms, steps = self._bench_decode(batch_size, context_len, decode_steps)
                     print(f"{batch_size:>6} {context_len:>8} {steps:>6} {elapsed_ms:>12.2f} {throughput:>14,.0f}")
-            except Exception as e:
+            except Exception as e:  # noqa
                 print(f"{batch_size:>6} {context_len:>8} {decode_steps:>6} {'SKIP':>12} {str(e)[:30]}")
                 if not str(e).startswith("CUDA out of memory"):
                     traceback.print_exc()
