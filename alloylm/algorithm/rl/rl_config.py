@@ -58,7 +58,6 @@ class UnifiedConfig(BaseModel):
     recompute_ratio: float = 0.0
     train_engine_version: float = float(os.environ.get("TRAIN_ENGINE_VERSION", "0.0"))
     chunk_loss_size: int = 512
-    sp_size: int = 1
     freeze_routers: bool = True
     max_prefill_length: int = 8 * 1024
     sampler_batch_size: int = 128
@@ -82,7 +81,6 @@ def create_trainer(
                 l_clip=config.clip_low,
                 loss_func=config.loss_func,
                 chunk_loss_size=config.chunk_loss_size,
-                sp_size=config.sp_size,
                 step_data_process_func=config.step_data_process_func,
             ),
             infer_config=InferEngineConfig(
