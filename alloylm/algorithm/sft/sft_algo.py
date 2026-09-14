@@ -220,7 +220,7 @@ class SFTTrainer:
             eta = timedelta(seconds=round(elapsed_time / completed_steps * remaining_steps))
 
             log_str = ", ".join(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in train_log.items())
-            self.logger.info(f"**SFT training step {step} logs: {log_str}, ETA: {eta}")
+            self.logger.info(f"SFT {step} / {self.config.total_training_steps}: {log_str}, ETA: {eta}")
             for k, v in train_log.items():
                 self.tb_writer.add_scalar(f"sft/{k}", v, step)
             self.tb_writer.add_scalar("sft/epoch", epoch, step)

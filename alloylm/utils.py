@@ -57,7 +57,7 @@ def get_logger(
                 handler.close()
             formatter = logging.Formatter(
                 f"[AlloyLM][{name}][%(asctime)s][%(levelname)s] %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
+                datefmt="%y-%m-%d %H:%M:%S",
             )
             if path:
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
