@@ -229,6 +229,7 @@ class TrainEngineConfig(BaseModel):
     # INFRA
     sp_size: int = 1
     chunk_loss_size: int = 512
+    gpu_peak_tflops: float = 100  # just a placeholder value
 
 
 class TrainEngine:
@@ -399,17 +400,22 @@ class TrainEngine:
         with torch.no_grad():
             total_tokens = torch.tensor(0.0, device="cuda")
             total_tokens_with_input = torch.tensor(0.0, device="cuda")
+            total_flops = torch.tensor(0.0, dtype=torch.float64, device="cuda")
             for packed_batch in micro_batch:
                 total_tokens += (packed_batch["labels"] != -100).sum().float().cuda()
                 total_tokens_with_input += (packed_batch["input_ids"] != -1).sum().float().cuda()
+                total_flops += self.patched_llm.compute_flops(packed_batch["seq_lens"].tolist())
             dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
             dist.all_reduce(total_tokens_with_input, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_flops, op=dist.ReduceOp.SUM)
             total_tokens = int(total_tokens.item())
             total_tokens_with_input = int(total_tokens_with_input.item())
+            total_flops = total_flops.item()
         if total_tokens == 0:
             self.logger.warning("No supervised tokens in this step, skipping.")
-            return {"loss": 0.0, "grad_norm": 0.0, "num_tokens": 0, "tgs": 0}
+            return {"loss": 0.0, "grad_norm": 0.0, "num_tokens": 0, "tgs": 0, "mfu": 0.0}
 
+        torch.cuda.synchronize()
         step_t0 = time.time()
         step_loss = 0.0
         for packed_batch in micro_batch:
@@ -446,8 +452,11 @@ class TrainEngine:
         # reduce loss across dp ranks for logging
         reduced_loss = torch.tensor(step_loss, device="cuda")
         dist.all_reduce(reduced_loss, op=dist.ReduceOp.AVG)
+        torch.cuda.synchronize()
         step_time = time.time() - step_t0
         tgs = int(total_tokens_with_input / self.config.sp_size / step_time / self.dp_size / self.config.sp_size)
+        per_gpu_flops = total_flops / self.config.sp_size / self.dp_size / self.config.sp_size
+        mfu = per_gpu_flops / step_time / (self.config.gpu_peak_tflops * 1e12)
 
         self.logger.info(
             f"[SFT] Step {self.train_state.cur_step}/{self.total_steps}  "
@@ -455,6 +464,7 @@ class TrainEngine:
             f"grad_norm: {grad_norm:.2f}  "
             f"lr: {self.cosine_scheduler.get_last_lr()[0]:.6f}  "
             f"tgs: {tgs}  "
+            f"mfu: {mfu:.2%}  "
             f"tokens: {int(total_tokens_with_input)}  "
             f"time: {step_time:.2f}s  "
             f"Mem: {torch.cuda.max_memory_allocated() / 1024**3:.1f} G"
@@ -466,6 +476,7 @@ class TrainEngine:
             "grad_norm": grad_norm.item(),
             "num_tokens": int(total_tokens_with_input),
             "tgs": tgs,
+            "mfu": mfu,
         }
 
     @torch.no_grad()
