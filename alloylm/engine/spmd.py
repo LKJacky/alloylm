@@ -5,7 +5,6 @@ import os
 import sys
 
 import ray
-import torch
 from pydantic import BaseModel as PydanticBaseModel
 from torch import distributed as dist
 
@@ -23,6 +22,24 @@ async def run_by_func_name(self, method, args, kwargs):
         return await func(*args, **kwargs)
     else:
         return func(*args, **kwargs)
+
+
+class _RaySPMDWorker:
+    def __init__(self, actor_cls, args, kwargs):
+        self.actor_cls = actor_cls
+        self.args = args
+        self.kwargs = kwargs
+        self.actor = None
+
+    def get_rendezvous(self):
+        return ray.util.get_node_ip_address(), get_free_port()
+
+    def initialize(self, envs):
+        os.environ.update(envs)
+        self.actor = self.actor_cls(*self.args, **self.kwargs)
+
+    async def run_by_func_name(self, method, args, kwargs):
+        return await run_by_func_name(self.actor, method, args, kwargs)
 
 
 class SPMDActorConfig(PydanticBaseModel):
@@ -89,31 +106,31 @@ class SPMDActor:
             except Exception:  # noqa
                 pass
 
-        init_ray()
-
-        master_addr = "127.0.0.1"
-        master_port = get_free_port()
         self._workers = []
         if spmd_config.world_size > 1 or os.environ.get("USE_RAY", "0") == "1":
-            for rank in range(spmd_config.world_size):
-                local_rank = rank % torch.cuda.device_count() if spmd_config.num_gpus > 0 else 0
+            init_ray()
+            worker_cls = ray.remote(_RaySPMDWorker)
+            for _ in range(spmd_config.world_size):
+                self._workers.append(
+                    worker_cls.options(
+                        num_gpus=spmd_config.num_gpus,
+                        num_cpus=spmd_config.num_cpus,
+                        memory=spmd_config.memory,
+                    ).remote(actor_cls, args, kwargs)
+                )
+
+            master_addr, master_port = ray.get(self._workers[0].get_rendezvous.remote())
+            init_refs = []
+            for rank, worker in enumerate(self._workers):
                 envs = {
                     "RANK": str(rank),
-                    "LOCAL_RANK": str(local_rank),
+                    "LOCAL_RANK": "0",
                     "WORLD_SIZE": str(spmd_config.world_size),
                     "MASTER_ADDR": master_addr,
                     "MASTER_PORT": str(master_port),
                 }
-                self._workers.append(
-                    ray.remote(actor_cls)
-                    .options(
-                        num_gpus=spmd_config.num_gpus,
-                        num_cpus=spmd_config.num_cpus,
-                        memory=spmd_config.memory,
-                        runtime_env={"env_vars": envs},
-                    )
-                    .remote(*args, **kwargs)
-                )
+                init_refs.append(worker.initialize.remote(envs))
+            ray.get(init_refs)
             self.use_ray = True
         else:
             os.environ.update(
@@ -121,8 +138,8 @@ class SPMDActor:
                     "RANK": str(0),
                     "LOCAL_RANK": str(0),
                     "WORLD_SIZE": str(1),
-                    "MASTER_ADDR": master_addr,
-                    "MASTER_PORT": str(master_port),
+                    "MASTER_ADDR": "127.0.0.1",
+                    "MASTER_PORT": str(get_free_port()),
                 }
             )
             self._workers.append(actor_cls(*args, **kwargs))
