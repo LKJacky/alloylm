@@ -48,9 +48,9 @@ class FakeTokenizer:
         return [ord(c) for c in text]
 
 
-def chat_template(converted_messages, add_generation_prompt=False):
+def chat_template(messages, add_generation_prompt=False):
     text = ""
-    for msg in converted_messages:
+    for msg in messages:
         text += f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n"
     if add_generation_prompt:
         text += "<|im_start|>assistant\n"
@@ -179,7 +179,8 @@ class SftCollateFnTest(unittest.TestCase):
         out = sft_collate_fn(batch)
 
         self.assertTrue(torch.equal(out["input_ids"], torch.tensor([[1, 2, 3, 4, 5]])))
-        self.assertTrue(torch.equal(out["labels"], torch.tensor([[-100, -100, 3, 4, 5]])))
+        self.assertTrue(torch.equal(out["shift_labels"], torch.tensor([[-100, 3, -100, 5, -100]])))
+        self.assertTrue(torch.equal(out["position_ids"], torch.tensor([[0, 1, 2, 0, 1]])))
         self.assertTrue(torch.equal(out["seq_lens"], torch.tensor([3, 2])))
 
 

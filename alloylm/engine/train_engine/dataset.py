@@ -193,15 +193,17 @@ def sft_collate_fn(batch, sp_size=1, sp_rank=0):
     seq_lens = [x for item in batch for x in item["seq_lens"]]
     position_ids = torch.tensor([x for n in seq_lens for x in range(n)])
 
-    # shift labels
+    # Shift labels without training across packed-sequence boundaries.
     shift_labels = torch.roll(labels, shifts=-1, dims=-1)
-    shift_labels[-1] = -100
+    shift_labels[torch.tensor(seq_lens).cumsum(0) - 1] = -100
 
     # deal sp
     input_ids = pad_and_split_for_sp(input_ids, value=0, sp_size=sp_size, sp_rank=sp_rank, dim=-1)
     shift_labels = pad_and_split_for_sp(shift_labels, value=-100, sp_size=sp_size, sp_rank=sp_rank, dim=-1)
     position_ids = pad_and_split_for_sp(position_ids, value=0, sp_size=sp_size, sp_rank=sp_rank, dim=-1)
-    seq_lens.append(input_ids.numel() * sp_size - sum(seq_lens))
+    padding = input_ids.numel() * sp_size - sum(seq_lens)
+    if padding:
+        seq_lens.append(padding)
 
     return {
         "input_ids": input_ids.unsqueeze(0),

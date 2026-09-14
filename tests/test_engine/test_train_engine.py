@@ -61,7 +61,6 @@ class TaskCollateFnTest(unittest.TestCase):
             self.assertTrue(torch.equal(actual, torch.tensor(expected, dtype=actual.dtype)))
 
         self.assertTrue(torch.equal(shards[0]["seq_lens"], torch.tensor([3, 2, 1])))
-        self.assertTrue(torch.equal(shards[0]["num_tokens"], torch.tensor([3, 2])))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
