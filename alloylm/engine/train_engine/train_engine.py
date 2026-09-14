@@ -104,9 +104,13 @@ def default_loss_func(
     return pg_loss, entropy
 
 
-class ChunkPolicyLoss(torch.autograd.Function):
-    """Compute policy loss in chunks to avoid materializing full [1, seq,
-    vocab] logits."""
+def default_sft_loss_func(logits: torch.Tensor, labels: torch.Tensor, loss_weight: float):
+    return F.cross_entropy(logits.flatten(0, 1), labels.flatten(), reduction="sum") * loss_weight
+
+
+class ChunkLoss(torch.autograd.Function):
+    """Compute a loss in chunks without materializing full vocabulary
+    logits."""
 
     @staticmethod
     def chunk_forward(hidden_states, head_weight, loss_fn, loss_kwargs):
@@ -114,36 +118,40 @@ class ChunkPolicyLoss(torch.autograd.Function):
         return loss_fn(logits, **loss_kwargs)
 
     @staticmethod
-    def forward(ctx, hidden_states, head_weight, loss_fn, loss_kwargs_chunks, chunk_size):
-        device = hidden_states.device
-        accumulated_loss = torch.tensor(0.0, device=device)
+    def forward(ctx, hidden_states, head_weight, loss_fn, loss_kwargs_chunks, chunk_size, has_aux):
+        accumulated_loss = torch.tensor(0.0, device=hidden_states.device)
         grad_hidden = torch.empty_like(hidden_states)
         grad_weight = torch.zeros_like(head_weight)
 
         h_chunks = torch.split(hidden_states, chunk_size, dim=1)
         grad_chunks = torch.split(grad_hidden, chunk_size, dim=1)
+        aux_parts = []
 
-        entropy_parts = []
-        for i in range(len(h_chunks)):
-            (chunk_grad_h, chunk_grad_w), (chunk_loss, entropy) = torch.func.grad_and_value(
-                ChunkPolicyLoss.chunk_forward, argnums=(0, 1), has_aux=True
-            )(h_chunks[i], head_weight, loss_fn, loss_kwargs_chunks[i])
+        for hidden_chunk, grad_chunk, loss_kwargs in zip(h_chunks, grad_chunks, loss_kwargs_chunks):
+            grad_and_value = torch.func.grad_and_value(ChunkLoss.chunk_forward, argnums=(0, 1), has_aux=has_aux)
+            if has_aux:
+                (chunk_grad_h, chunk_grad_w), (chunk_loss, aux) = grad_and_value(
+                    hidden_chunk, head_weight, loss_fn, loss_kwargs
+                )
+                aux_parts.append(aux.detach())
+            else:
+                (chunk_grad_h, chunk_grad_w), chunk_loss = grad_and_value(
+                    hidden_chunk, head_weight, loss_fn, loss_kwargs
+                )
 
             accumulated_loss.add_(chunk_loss)
-            grad_chunks[i].copy_(chunk_grad_h)
+            grad_chunk.copy_(chunk_grad_h)
             grad_weight.add_(chunk_grad_w)
-            entropy_parts.append(entropy.detach())
 
         ctx.save_for_backward(grad_hidden, grad_weight)
-        return accumulated_loss, torch.cat(entropy_parts, dim=1)
+        if has_aux:
+            return accumulated_loss, torch.cat(aux_parts, dim=1)
+        return accumulated_loss
 
     @staticmethod
     def backward(ctx, *grad_output):
-        grad_input, grad_weight = ctx.saved_tensors
-        if torch.ne(grad_output[0], torch.tensor(1.0, device=grad_output[0].device)):
-            grad_input = grad_input * grad_output[0]
-            grad_weight = grad_weight * grad_output[0]
-        return grad_input, grad_weight, None, None, None
+        grad_hidden, grad_weight = ctx.saved_tensors
+        return grad_hidden * grad_output[0], grad_weight * grad_output[0], None, None, None, None
 
 
 # state
@@ -407,20 +415,30 @@ class TrainEngine:
             seq_lens = packed_batch["seq_lens"].cuda()
             position_ids = packed_batch["position_ids"].cuda()
 
-            logits = self.patched_llm.train_forward(
-                TrainInput(input_ids=input_ids, position_ids=position_ids, seq_lens=seq_lens.int())
-            )  # [1, seq, vocab]
-
-            logits = logits.view(-1, logits.size(-1))
-            shift_labels = shift_labels.view(-1)
-
-            n_valid = (shift_labels >= 0).sum()
-            if n_valid == 0:
+            mask = shift_labels[0] >= 0
+            if not mask.any():
                 continue
 
-            loss = F.cross_entropy(logits, shift_labels, ignore_index=-100)
-            # normalize so the optimizer step averages over all supervised tokens
-            loss = loss * (n_valid / total_tokens * self.num_workers)
+            def _chunk_loss(hidden_states, _shift_labels=shift_labels, _mask=mask):
+                hidden_states = hidden_states[:, : _shift_labels.size(1)]
+                labels = _shift_labels[:, _mask]
+                return ChunkLoss.apply(
+                    hidden_states[:, _mask],
+                    self.patched_llm.lm_head.weight,
+                    default_sft_loss_func,
+                    [
+                        {"labels": chunk, "loss_weight": self.num_workers / total_tokens}
+                        for chunk in torch.split(labels, self.config.chunk_loss_size, dim=1)
+                    ],
+                    self.config.chunk_loss_size,
+                    False,
+                )
+
+            with self._dispatch_lm_head(_chunk_loss):
+                loss = self.patched_llm.train_forward(
+                    TrainInput(input_ids=input_ids, position_ids=position_ids, seq_lens=seq_lens.int())
+                )
+
             loss.backward()
             step_loss += loss.item()
 
@@ -616,7 +634,7 @@ class TrainEngine:
                 position_ids = packed_batch["position_ids"].cuda()
                 seq_lens = packed_batch["seq_lens"].cuda()
 
-                # Chunk mode: monkey-patch lm_head with ChunkPolicyLoss
+                # Chunk mode: monkey-patch lm_head with ChunkLoss
                 # mask is 1D [seq_sp] — excludes both -100 (mask) and SP padding (negative pad values)
                 mask = shift_labels_for_sp[0] >= 0
 
@@ -631,7 +649,7 @@ class TrainEngine:
                 ):
                     # Trim hidden_states to match labels (SP padding stripped)
                     hidden_states = hidden_states[:, : _shift_labels_for_sp.size(1)]
-                    loss, entropy = ChunkPolicyLoss.apply(
+                    loss, entropy = ChunkLoss.apply(
                         hidden_states[:, _mask],
                         self.patched_llm.lm_head.weight,
                         default_loss_func if self.config.loss_func is None else self.config.loss_func,
@@ -650,6 +668,7 @@ class TrainEngine:
                             )
                         ],
                         self.config.chunk_loss_size,
+                        True,
                     )
                     return loss, entropy.detach()
 
