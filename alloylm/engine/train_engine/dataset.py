@@ -11,6 +11,8 @@ from torch import distributed as dist
 from torch.utils.data import ConcatDataset, Dataset
 from transformers import AutoTokenizer
 
+from .utils import pad_and_split_for_sp
+
 
 def distangle_train_or_not_train(messages: list[dict], chat_template):
     # distinguish between has loss or not.
@@ -157,7 +159,7 @@ def task_collate_fn(batch):
 
 
 @torch.inference_mode()
-def sft_collate_fn(batch):
+def sft_collate_fn(batch, sp_size=1, sp_rank=0):
     """Collate a list of ``SFTDataset`` samples into one packed sequence.
 
     Each sample is the dict returned by ``SFTDataset.__getitem__`` with
@@ -166,12 +168,25 @@ def sft_collate_fn(batch):
     plus a ``[num_seqs]`` ``seq_lens`` tensor, matching what
     ``TrainEngine.step_sft`` consumes.
     """
-    input_ids = [x for item in batch for x in item["input_ids"]]
-    labels = [x for item in batch for x in item["labels"]]
+    input_ids = torch.tensor([x for item in batch for x in item["input_ids"]])
+    labels = torch.tensor([x for item in batch for x in item["labels"]])
     seq_lens = [x for item in batch for x in item["seq_lens"]]
+    position_ids = torch.tensor([x for n in seq_lens for x in range(n)])
+
+    # shift labels
+    shift_labels = torch.roll(labels, shifts=-1, dims=-1)
+    shift_labels[-1] = -100
+
+    # deal sp
+    input_ids = pad_and_split_for_sp(input_ids, value=0, sp_size=sp_size, sp_rank=sp_rank, dim=-1)
+    shift_labels = pad_and_split_for_sp(shift_labels, value=-100, sp_size=sp_size, sp_rank=sp_rank, dim=-1)
+    position_ids = pad_and_split_for_sp(position_ids, value=0, sp_size=sp_size, sp_rank=sp_rank, dim=-1)
+    seq_lens.append(input_ids.numel() * sp_size - sum(seq_lens))
+
     return {
-        "input_ids": torch.tensor(input_ids).unsqueeze(0),
-        "labels": torch.tensor(labels).unsqueeze(0),
+        "input_ids": input_ids.unsqueeze(0),
+        "shift_labels": shift_labels.unsqueeze(0),
+        "position_ids": position_ids.unsqueeze(0),
         "seq_lens": torch.tensor(seq_lens),
     }
 

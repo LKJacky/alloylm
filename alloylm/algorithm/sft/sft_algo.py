@@ -92,8 +92,6 @@ class SFTTrainer:
         # the engine's SFTDataset (workers), so num_tokens agree on both sides.
         self.tokenizer = config.tokenizer
         self.chat_template = config.chat_template
-        self.dp_size = config.llm_config.fsdp_config.train_mesh["mesh_shape"][0]
-        self.sp_size = config.engine_config.train_config.sp_size
 
         # Populated by lazy_init / advanced by fit.
         self.jsonl_paths: list[str] = []
@@ -154,14 +152,14 @@ class SFTTrainer:
         self.steps_per_epoch = len(self.packs) // self.config.global_batch_size
 
         assert self.steps_per_epoch >= 1, (
-            f"Not enough packs for a single optimizer step: {len(self.packs)} packs across dp_size={self.dp_size} "
+            f"Not enough packs for a single optimizer step: {len(self.packs)} packs"
             f"Add more data or lower global_batch_size={self.config.global_batch_size}."
         )
 
-        total_tokens = sum(sum(p.num_tokens) for p in self.packs)
+        total_tokens = sum(sum(p.num_tokens) for p in self.packs) / 10**9
         self.logger.info(
-            f"SFT data ready: {len(self.packs)} packs, {total_tokens} tokens, {len(self.jsonl_paths)} files, {num_skip} skipped samples, "
-            f"dp_size={self.dp_size}, {self.steps_per_epoch} steps/epoch (global_batch_size={self.config.global_batch_size})."
+            f"SFT data ready: {len(self.packs)} packs, {total_tokens:.2f}B tokens, {len(self.jsonl_paths)} files, {num_skip} skipped samples, "
+            f"{self.steps_per_epoch} steps/epoch (global_batch_size={self.config.global_batch_size})."
         )
         if self.config.total_training_steps == -1:
             self.config.total_training_steps = self.steps_per_epoch
@@ -211,8 +209,9 @@ class SFTTrainer:
             # total_tokens is reduced across all ranks and therefore duplicated
             # across sequence-parallel ranks. Report throughput per GPU.
             train_time = timer.summary()["step_time.train_time"]
-            global_tokens = train_log["num_tokens"] / self.sp_size
-            train_log["tgs"] = int(global_tokens / train_time / self.dp_size / self.sp_size)
+            train_log["tgs"] = int(
+                train_log["num_tokens"] / train_time / self.config.engine_config.train_config.num_workers
+            )
 
             elapsed_time = time.time() - t0
             completed_steps = step - start_step + 1

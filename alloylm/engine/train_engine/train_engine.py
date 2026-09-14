@@ -7,6 +7,7 @@ from collections.abc import Callable
 from concurrent.futures import wait
 from contextlib import contextmanager
 from datetime import timedelta
+from functools import partial
 from typing import Any, TypedDict
 
 import ray
@@ -279,6 +280,7 @@ class TrainEngine:
         self.dp_mesh = self.patched_llm.fsdp_config.train_mesh["dp"]
         self.sp_mesh = self.patched_llm.fsdp_config.train_mesh["sp"]
         self.dp_size = self.dp_mesh.size()
+        self.num_workers = self.patched_llm.fsdp_config.train_mesh.size()
         self.setup_optim()
         dist.barrier()
         gc.collect()
@@ -371,7 +373,7 @@ class TrainEngine:
             dataset,
             batch_size=1,
             num_workers=0,
-            collate_fn=sft_collate_fn,
+            collate_fn=partial(sft_collate_fn, sp_size=self.sp_mesh.size(), sp_rank=self.sp_mesh.get_local_rank()),
             persistent_workers=False,
             sampler=DistributedSampler(
                 dataset,
@@ -402,9 +404,9 @@ class TrainEngine:
             total_tokens_with_input = torch.tensor(0.0, device="cuda")
             total_flops = torch.tensor(0.0, dtype=torch.float64, device="cuda")
             for packed_batch in micro_batch:
-                total_tokens += (packed_batch["labels"] != -100).sum().float().cuda()
-                total_tokens_with_input += (packed_batch["input_ids"] != -1).sum().float().cuda()
-                total_flops += self.patched_llm.compute_flops(packed_batch["seq_lens"].tolist())
+                total_tokens += (packed_batch["shift_labels"] != -100).sum().float().cuda()
+                total_tokens_with_input += packed_batch["input_ids"].numel()
+                total_flops += self.patched_llm.compute_flops(packed_batch["seq_lens"].tolist()) / self.sp_mesh.size()
             dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
             dist.all_reduce(total_tokens_with_input, op=dist.ReduceOp.SUM)
             dist.all_reduce(total_flops, op=dist.ReduceOp.SUM)
@@ -420,22 +422,23 @@ class TrainEngine:
         step_loss = 0.0
         for packed_batch in micro_batch:
             input_ids = packed_batch["input_ids"].cuda()
-            labels = packed_batch["labels"].cuda()
+            shift_labels = packed_batch["shift_labels"].cuda()  # had been shifted
             seq_lens = packed_batch["seq_lens"].cuda()
-            position_ids = torch.cat([torch.arange(n) for n in seq_lens.tolist()], dim=0).cuda().unsqueeze_(0)
+            position_ids = packed_batch["position_ids"].cuda()
 
             logits = self.patched_llm.train_forward(
                 TrainInput(input_ids=input_ids, position_ids=position_ids, seq_lens=seq_lens.int())
             )  # [1, seq, vocab]
 
-            shift_logits = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
-            shift_labels = labels[:, 1:].contiguous().view(-1)
+            logits = logits.view(-1, logits.size(-1))
+            shift_labels = shift_labels.view(-1)
+
             n_valid = (shift_labels >= 0).sum()
             if n_valid == 0:
                 continue
-            loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+            loss = F.cross_entropy(logits, shift_labels, ignore_index=-100)
             # normalize so the optimizer step averages over all supervised tokens
-            loss = loss * (n_valid / total_tokens * self.dp_size)
+            loss = loss * (n_valid / total_tokens * self.num_workers)
             loss.backward()
             step_loss += loss.item()
 
@@ -454,8 +457,8 @@ class TrainEngine:
         dist.all_reduce(reduced_loss, op=dist.ReduceOp.AVG)
         torch.cuda.synchronize()
         step_time = time.time() - step_t0
-        tgs = int(total_tokens_with_input / self.config.sp_size / step_time / self.dp_size / self.config.sp_size)
-        per_gpu_flops = total_flops / self.config.sp_size / self.dp_size / self.config.sp_size
+        tgs = int(total_tokens_with_input / step_time / self.num_workers)
+        per_gpu_flops = total_flops / self.num_workers
         mfu = per_gpu_flops / step_time / (self.config.gpu_peak_tflops * 1e12)
 
         self.logger.info(

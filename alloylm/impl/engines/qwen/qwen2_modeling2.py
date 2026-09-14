@@ -54,8 +54,6 @@ from alloylm.engine.train_engine.utils import (
     HFCheckpointLoader,
     get_engine_logger,
     lazy_init_fn,
-    pad_to_multiple_of,
-    split_for_sequence_parallel,
 )
 
 from .flash_attn import flash_attn_varlen_fwd
@@ -657,11 +655,8 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
         cu_seq_lens_k=None,
         max_length_q=None,
         max_length_k=None,
-        sequence_parallel_mesh=None,
         **kwargs,
     ):
-        if sequence_parallel_mesh is None:
-            sequence_parallel_mesh = self.fsdp_config.train_mesh["sp"]
 
         _input_ids = input_ids
         _position_ids = position_ids
@@ -676,28 +671,6 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
             max_length_k = max_length_q
         else:
             assert all(x is not None for x in [cu_seq_lens_k, max_length_q, max_length_k])
-
-        if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
-            multiple_of = sequence_parallel_mesh.size() * 1
-        else:
-            multiple_of = 1
-
-        _input_ids = pad_to_multiple_of(_input_ids, 0, multiple_of, 1)
-        _position_ids = pad_to_multiple_of(_position_ids, 0, multiple_of, 1)
-
-        num_padded_tokens = _input_ids.numel() - input_ids.numel()
-
-        if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
-            _input_ids = split_for_sequence_parallel(_input_ids, dim=1, sp_mesh=sequence_parallel_mesh)
-            _position_ids = split_for_sequence_parallel(_position_ids, dim=1, sp_mesh=sequence_parallel_mesh)
-
-        if self.training and num_padded_tokens > 0:
-            assert torch.any(cu_seq_lens_k == cu_seq_lens_q)
-            cu_seq_lens_q = torch.cat((cu_seq_lens_q, cu_seq_lens_q[-1:] + num_padded_tokens))
-            cu_seq_lens_k = cu_seq_lens_q
-
-            max_length_q = max(max_length_q, num_padded_tokens)
-            max_length_k = max_length_q
 
         return (_input_ids, _position_ids), {
             "cu_seq_lens_q": cu_seq_lens_q,
