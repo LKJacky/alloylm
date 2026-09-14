@@ -345,6 +345,7 @@ class TrainEngine:
 
         dataloader.sampler.set_epoch(0)
         self.train_rl_step(batch, step, dataloader, batch_info)
+        batch_info["lr"] = self.optimizer.param_groups[0]["lr"]
 
         return batch_info
 
@@ -460,12 +461,13 @@ class TrainEngine:
         tgs = int(total_tokens_with_input / step_time / self.num_workers)
         per_gpu_flops = total_flops / self.num_workers
         mfu = per_gpu_flops / step_time / (self.config.gpu_peak_tflops * 1e12)
+        learning_rate = self.optimizer.param_groups[0]["lr"]
 
         self.logger.info(
             f"[SFT] Step {self.train_state.cur_step}/{self.total_steps}  "
             f"loss: {reduced_loss.item():.4f}  "
             f"grad_norm: {grad_norm:.2f}  "
-            f"lr: {self.cosine_scheduler.get_last_lr()[0]:.6f}  "
+            f"lr: {learning_rate:.6g}  "
             f"tgs: {tgs}  "
             f"mfu: {mfu:.2%}  "
             f"tokens: {int(total_tokens_with_input)}  "
@@ -477,6 +479,7 @@ class TrainEngine:
         return {
             "loss": reduced_loss.item(),
             "grad_norm": grad_norm.item(),
+            "lr": learning_rate,
             "num_tokens": int(total_tokens_with_input),
             "tgs": tgs,
             "mfu": mfu,
@@ -720,6 +723,7 @@ class TrainEngine:
                 f"entropy_std: {entropy_std:.4f}  "
                 f"small_entropy_ratio: {count_small_entropy.item() / global_num_tokens.item():.4f}  "
                 f"grad_norm: {grad_norm:.2f}  "
+                f"lr: {self.optimizer.param_groups[0]['lr']:.6g}  "
                 f"tgs: {tgs}  "
                 f"tokens: {global_num_tokens.item()}  "
                 f"time: {step_time:.2f}s  "
