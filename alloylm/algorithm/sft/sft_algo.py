@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import random
 import shutil
@@ -157,8 +158,9 @@ class SFTTrainer:
         )
 
         total_tokens = sum(sum(p.num_tokens) for p in self.packs) / 10**9
+        max_sample_length = max([x for p in self.packs for x in p.num_tokens])
         self.logger.info(
-            f"SFT data ready: {len(self.packs)} packs, {total_tokens:.2f}B tokens, {len(self.jsonl_paths)} files, {num_skip} skipped samples, "
+            f"SFT data ready: {len(self.packs)} packs, {total_tokens:.2f}B tokens, max_length={math.ceil(max_sample_length / 1024)}, {len(self.jsonl_paths)} files, {num_skip} skipped samples, "
             f"{self.steps_per_epoch} steps/epoch (global_batch_size={self.config.global_batch_size})."
         )
         if self.config.total_training_steps == -1:

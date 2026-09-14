@@ -55,6 +55,8 @@ class SFTPackDataset(Dataset):
         num_workers = min(num_workers, max(1, len(sample_infos) // 1000))
         num_samples_per_worker = (len(sample_infos) + num_workers - 1) // num_workers
 
+        # count tokens
+
         remote_count_tokens = ray.remote(self.count_tokens)
         file_paths_ref = ray.put(self.file_paths)
         tokenizer_ref = ray.put(self.tokenizer)
@@ -83,12 +85,16 @@ class SFTPackDataset(Dataset):
             for future in futures:
                 ray.cancel(future, force=True)
 
+        # Flatten the counted samples into self.data according to the sample ratios.
+
         for file_idx, samples in enumerate(counted_samples):
             ratio = self.sample_ratios[file_idx]
             full = int(ratio)
             selected = list(range(len(samples))) * full
             selected.extend(self.rng.sample(range(len(samples)), k=int(len(samples) * (ratio - full))))
             self.data.extend(samples[index] for index in selected)
+
+        # Pack the flattened data into fixed-size chunks according to max_length.
 
         self.packed_data, self.num_skip_data = self.pack_data(self.data, self.max_length)
 
