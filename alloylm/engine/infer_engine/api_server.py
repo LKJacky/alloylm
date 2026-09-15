@@ -215,7 +215,11 @@ def parse_tool_calls(text: str, tool_pattern: re.Pattern) -> tuple[str, list[dic
 
 
 def parse_thinking(text: str, thinking_pattern: re.Pattern) -> tuple[str | None, str | None]:
-    match = next(thinking_pattern.finditer(text))
+    try:
+        match = next(thinking_pattern.finditer(text))
+    except StopIteration:
+        return None, text
+
     payload = match.group(1)
     if payload is not None:
         return thinking_pattern.sub("", text), payload
