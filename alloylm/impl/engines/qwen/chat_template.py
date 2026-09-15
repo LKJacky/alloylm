@@ -3,7 +3,8 @@
 import json
 from collections.abc import Mapping
 
-QWEN_TOOL_PATTERN = r"<tool_call>\s*(.*?)\s*</tool_call>"
+QWEN_TOOL_PATTERN = r"<tool_call>(.*?)</tool_call>"
+QWEN_THINKING_PATTERN = r"\A(.*?)</think>"
 
 
 def _get(value, key, default=None):

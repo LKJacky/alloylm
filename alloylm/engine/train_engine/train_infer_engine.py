@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import logging
 import os
 import uuid
 from collections.abc import Callable
@@ -54,7 +55,8 @@ class TrainInferEngine:
                 engine_config.train_config.work_dir,
                 f"{engine_logger_name()}.log",
             ),
-            output_to_stdout=False,
+            output_to_stdout=True,
+            log_level=logging.WARNING,
             force_recreate=True,
         )
         self.model = model_config.build()

@@ -30,6 +30,7 @@ class InferEngineConfig(PydanticBaseModel):
     proxy_url: str | None = None
 
     tool_pattern: str | None = None
+    thinking_pattern: str | None = None
 
 
 class InferEngine:
@@ -95,6 +96,7 @@ class InferEngine:
             proxy_url=proxy_url,
             model_name=engine_config.model_name,
             tool_pattern=engine_config.tool_pattern,
+            thinking_pattern=engine_config.thinking_pattern,
         )
 
         self.gather_context = GatherContext(model)

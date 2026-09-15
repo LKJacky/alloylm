@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import traceback
 import uuid
@@ -138,10 +139,15 @@ class Messages:
     def render_messages(self, new_messages, for_generate=False, tools=None, thinking=False):
         self.messages.extend(new_messages)
         self.formated_messages.extend(new_messages)
+
         text = self._get_text(add_generation_prompt=for_generate, tools=tools, thinking=thinking)
-        assert text.startswith(self.cached_text), (
-            f"New text should start with cached text, but got:\nCached:\n{self.cached_text}\nNew:\n{text}"
-        )
+        if not text.startswith(self.cached_text):
+            common_prefix = os.path.commonprefix([self.cached_text, text])[:-20]  # keep some context
+            get_logger().critical(
+                "New text does not start with cached text, causing potential inconsistencies in message rendering.\n"
+                f"new text: {text.removeprefix(common_prefix)}\n"
+                f"cached text: {self.cached_text.removeprefix(common_prefix)}"
+            )
         diff_text = text[len(self.cached_text) :]
         self.cached_text = text
         return diff_text
@@ -208,6 +214,16 @@ def parse_tool_calls(text: str, tool_pattern: re.Pattern) -> tuple[str, list[dic
         return text, []
 
 
+def parse_thinking(text: str, thinking_pattern: re.Pattern) -> tuple[str | None, str | None]:
+    match = next(thinking_pattern.finditer(text))
+    payload = match.group(1)
+    if payload is not None:
+        return thinking_pattern.sub("", text), payload
+    else:
+        # thinking pattern is not closed or not properly formatted, assume all content is reasoning content to make sure prefix consistency for chat template
+        return None, text
+
+
 # server
 
 
@@ -221,6 +237,7 @@ class APIServer:
         proxy_url=None,
         model_name="",
         tool_pattern: str | None = None,
+        thinking_pattern: str | None = None,
     ):
         self.tokenizer = tokenizer
         jinja_env = ImmutableSandboxedEnvironment(
@@ -255,6 +272,7 @@ class APIServer:
             f"Use eos token {self.tokenizer.eos_token}({self.tokenizer.eos_token_id}) as default stop token"
         )
         self.tool_pattern = re.compile(tool_pattern, re.DOTALL) if tool_pattern else None
+        self.thinking_pattern = re.compile(thinking_pattern, re.DOTALL) if thinking_pattern else None
 
         self.cached_infer_info = {}
 
@@ -387,24 +405,31 @@ class APIServer:
         # generate
         response, input_ids, result = await self.run_infer(session, gene_config, text=text)
         # parse tools
-        if self.tool_pattern:
-            respone_formated, tool_calls = parse_tool_calls(response, tool_pattern=self.tool_pattern)
+        if self.thinking_pattern:
+            response_wo_think, thinking_content = parse_thinking(response, thinking_pattern=self.thinking_pattern)
         else:
-            respone_formated, tool_calls = response, []
+            response_wo_think, thinking_content = response, None
+        if self.tool_pattern:
+            response_wo_tools, tool_calls = parse_tool_calls(response_wo_think, tool_pattern=self.tool_pattern)
+        else:
+            response_wo_tools, tool_calls = response_wo_think, []
 
         message = {
             "role": "assistant",
-            "content": respone_formated,
+            "content": response_wo_tools,
         }
+        if thinking_content:
+            message["thinking_content"] = thinking_content
         if tool_calls:
             message["tool_calls"] = tool_calls
 
         # update session
         session.messages.cached_text += response
         session.messages.messages.append(
-            {"role": "assistant", "content": response}
-        )  # for text recovery, we save pure text content.
+            {"role": "assistant", "content": response_wo_think, "reasoning_content": thinking_content}
+        )  # do not parse tools, because they are not reversible
         session.messages.formated_messages.append(message)
+
         if request.for_training:
             output_ids = result["tokens"]
             session.training_input_ids.extend(input_ids + output_ids)

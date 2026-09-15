@@ -129,7 +129,23 @@ class ProxyServer:
         self.logger.info(f"Launched Proxy Server running on {self.ip}:{self.port} with {self.method_name} method")
 
     async def chat_completion(self, request: Request):
-        return await self.transmit(request, post_url="v1/chat/completions")
+        if not hasattr(self, "interactive_sessions"):
+            self.interactive_sessions = {}
+        request_content = await request.json()
+        if "session_id" in request_content:
+            session_id = request_content.get("session_id")
+            if session_id not in self.interactive_sessions:
+                model_name = request_content.get("model", self.servers.keys().__iter__().__next__())
+                server_url = self.acquire_server_url(model_name)
+                self.interactive_sessions[session_id] = (model_name, server_url)
+            model_name, server_url = self.interactive_sessions[session_id]
+        else:
+            server_url = None
+        try:
+            return await self.transmit(request, post_url="v1/chat/completions", server_url=server_url)
+        finally:
+            if server_url is not None and len(request_content["messages"]) == 0:
+                self.release_server_url(model_name, server_url)
 
     async def chat_interactive_v1(self, request: Request):
         if not hasattr(self, "interactive_sessions"):
