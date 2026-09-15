@@ -18,6 +18,7 @@ def json2str(value):
 
 class Qwen3ChatTemplate:
     # this is a modified qwen3 chat template. The main difference is that the template do not drop past reasoning content, and it will keep all the reasoning content in the final output.
+    # remove \n in think template
     @classmethod
     def render(
         cls,
@@ -88,9 +89,9 @@ class Qwen3ChatTemplate:
                 #     output.append(f"<|im_start|>assistant\n{content}")
 
                 if reasoning_content:
-                    output.append(f"<|im_start|>assistant\n<think>\n\n{reasoning_content}</think>{content}")
+                    output.append(f"<|im_start|>assistant\n<think>{reasoning_content}</think>{content}")
                 else:
-                    output.append(f"<|im_start|>assistant\n<think>\n\n</think>\n\n{content}")
+                    output.append(f"<|im_start|>assistant\n<think></think>{content}")
 
                 ###############################################################################
 
@@ -120,10 +121,10 @@ class Qwen3ChatTemplate:
         if add_generation_prompt:
             output.append("<|im_start|>assistant\n")
             if enable_thinking is False:
-                output.append("<think>\n\n</think>\n\n")
+                output.append("<think></think>")
             # + ###########################################################
             else:
-                output.append("<think>\n\n")
+                output.append("<think>")
             ###############################################################
 
         return "".join(output)

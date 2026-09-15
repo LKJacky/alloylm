@@ -111,6 +111,7 @@ class ChatCompletionRequest(BaseModel):
     session_id: int = -1
     max_entropy: float = 100.0
     for_training: bool = False
+    chat_template_kwargs: dict = {"thinking": False}
 
     # unsupported params
     logprobs: bool | None = False
@@ -134,10 +135,10 @@ class Messages:
         self.formated_messages = []
         self.cached_text = ""
 
-    def render_messages(self, new_messages, for_generate=False, tools=None):
+    def render_messages(self, new_messages, for_generate=False, tools=None, thinking=False):
         self.messages.extend(new_messages)
         self.formated_messages.extend(new_messages)
-        text = self._get_text(add_generation_prompt=for_generate, tools=tools)
+        text = self._get_text(add_generation_prompt=for_generate, tools=tools, thinking=thinking)
         assert text.startswith(self.cached_text), (
             f"New text should start with cached text, but got:\nCached:\n{self.cached_text}\nNew:\n{text}"
         )
@@ -145,15 +146,13 @@ class Messages:
         self.cached_text = text
         return diff_text
 
-    def _get_text(self, add_generation_prompt=True, tools=None):
-        try:
-            return self.chat_template.render(
-                messages=self.messages, add_generation_prompt=add_generation_prompt, enable_thinking=False, tools=tools
-            )
-        except Exception:  # noqa
-            return self.chat_template.render(
-                messages=self.messages, add_generation_prompt=add_generation_prompt, tools=tools
-            )
+    def _get_text(self, add_generation_prompt=True, tools=None, thinking=False):
+        return self.chat_template.render(
+            messages=self.messages,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=thinking,
+            tools=tools,
+        )
 
 
 class SessionItem:
@@ -169,8 +168,13 @@ class SessionItem:
     def forward_tokens(self, tokens):
         self.forwarded_tokens += tokens
 
-    def render_messages(self, new_messages, for_generate=False, tools=None):
-        return self.messages.render_messages(new_messages, for_generate=for_generate, tools=tools)
+    def render_messages(self, new_messages, for_generate=False, tools=None, thinking=False):
+        return self.messages.render_messages(
+            new_messages,
+            for_generate=for_generate,
+            tools=tools,
+            thinking=thinking,
+        )
 
 
 def parse_tool_calls(text: str, tool_pattern: re.Pattern) -> tuple[str, list[dict]]:
@@ -374,7 +378,12 @@ class APIServer:
         session: SessionItem = self.get_session(request.session_id)
         # get input text
         new_messages = request.messages[len(session.messages.messages) :]
-        text = session.render_messages(new_messages, for_generate=True, tools=request.tools)
+        text = session.render_messages(
+            new_messages,
+            for_generate=True,
+            tools=request.tools,
+            thinking=request.chat_template_kwargs.get("thinking", False),
+        )
         # generate
         response, input_ids, result = await self.run_infer(session, gene_config, text=text)
         # parse tools
