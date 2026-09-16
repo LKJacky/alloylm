@@ -7,16 +7,26 @@ import torch
 from torch import distributed as dist
 
 from alloylm.algorithm.base import InferArgs, TaskData
-from alloylm.algorithm.rl.rl_config import UnifiedConfig, create_trainer
+from alloylm.algorithm.rl.rl_config import (
+    InferEngineConfig,
+    RLAlgorithmConfig,
+    RLTrainer,
+    TrainEngineConfig,
+    TrainInferEngineConfig,
+)
 from alloylm.engine.model import AlloyLMModelConfig
 from alloylm.engine.train_engine.utils import FSDPConfig
 from alloylm.impl.count_to_n import CountToNDatasetConfig
-from alloylm.impl.engines.qwen.chat_template import QWEN_TOOL_PATTERN, Qwen3ChatTemplate
+from alloylm.impl.engines.qwen.chat_template import (
+    QWEN_THINKING_PATTERN,
+    QWEN_TOOL_PATTERN,
+    Qwen3ChatTemplate,
+)
 from alloylm.impl.engines.qwen.qwen2_modeling2 import FSDPQwen2ForCausalLM
 from alloylm.impl.math import GSM8KDatasetConfig
 from alloylm.test_utils import CudaAsyncTestCase, collect_garbage
 
-train_infer_args = InferArgs(
+TRAIN_INFER_ARGS = InferArgs(
     sample_args={
         "top_p": 1.0,
         "temperature": 1.0,
@@ -24,9 +34,9 @@ train_infer_args = InferArgs(
         "extra_body": {"for_training": True},
     }
 )
-eval_infer_args = InferArgs(sample_args={"top_p": 1.0, "temperature": 1.0, "max_tokens": 512})
+EVAL_INFER_ARGS = InferArgs(sample_args={"top_p": 1.0, "temperature": 1.0, "max_tokens": 512})
 
-default_config = UnifiedConfig(
+default_config = RLAlgorithmConfig(
     llm_config=AlloyLMModelConfig(
         path="Qwen/Qwen3-0.6B",
         model_cls=FSDPQwen2ForCausalLM,
@@ -37,39 +47,50 @@ default_config = UnifiedConfig(
             shard_dtype=torch.bfloat16,
         ),
     ),
-    max_length_rollout=1024,
-    max_length_train=1024,
-    # data
-    train_datasets=[
-        GSM8KDatasetConfig(name="gsm8k_1", split="train", infer_args=train_infer_args),
-        GSM8KDatasetConfig(name="gsm8k_2", split="train", infer_args=train_infer_args),
+    engine_config=TrainInferEngineConfig(
+        train_config=TrainEngineConfig(
+            max_length=4096,
+            work_dir="work_dirs/tests/rl/",
+            num_workers=1,
+            total_training_steps=5,
+            lr=8e-6,
+            wd=0,
+            scheduler_type="cosine",
+            warmup_ratio=0.03,
+            chunk_loss_size=512,
+        ),
+        infer_config=InferEngineConfig(
+            model_name="ALLOYLM",
+            max_prefill_length=8192,
+            chat_template=Qwen3ChatTemplate,
+            tool_pattern=QWEN_TOOL_PATTERN,
+            thinking_pattern=QWEN_THINKING_PATTERN,
+            memory_usage=0.7,
+        ),
+    ),
+    datasets=[
+        GSM8KDatasetConfig(name="gsm8k_1", split="train", infer_args=TRAIN_INFER_ARGS),
+        GSM8KDatasetConfig(name="gsm8k_2", split="train", infer_args=TRAIN_INFER_ARGS),
     ],
     train_sample_ratios=[1.0, 1.0],
     eval_datasets=[
-        GSM8KDatasetConfig(name="gsm8k_1", split="test", infer_args=eval_infer_args),
-        GSM8KDatasetConfig(name="gsm8k_2", split="test", infer_args=eval_infer_args),
+        GSM8KDatasetConfig(name="gsm8k_1", split="test", infer_args=EVAL_INFER_ARGS),
+        GSM8KDatasetConfig(name="gsm8k_2", split="test", infer_args=EVAL_INFER_ARGS),
     ],
-    eval_sample_ratios=[0.001, 0.001],
-    # rl algo
-    roll_out_bs=16,
+    eval_sample_ratio=[0.001, 0.001],
+    eval_interval=100,
+    roll_out_bs=4,
     num_rl_group=4,
-    num_optimize_per_step=1,
-    filter_group="none",
-    async_rollout="none",
-    # pipeline
+    max_length=4096,
     total_training_steps=5,
-    checkpoint_interval=4,
+    checkpoint_interval=100,
     max_checkpoints=1,
-    eval_interval=4,
     auto_resume=False,
-    # infra
+    async_rollout="task",
+    filter_group="resubmit",
+    data_post_process_func=None,
     work_dir="work_dirs/tests/rl/",
-    num_workers=1,
-    max_concurrency_per_node=128,
-    cache_max_entry_count=0.2,
-    max_prefill_length=1024,
-    chat_template=Qwen3ChatTemplate,
-    tool_pattern=QWEN_TOOL_PATTERN,
+    max_concurrency=64,
 )
 
 
@@ -85,7 +106,7 @@ class TestRLSystem(RLTest):
         shutil.rmtree("work_dirs/tests/rl", ignore_errors=True)
         config = copy.deepcopy(self.default_config)
         config.work_dir = "work_dirs/tests/rl"
-        trainer = create_trainer(config)
+        trainer = RLTrainer(config)
         await trainer.lazy_init()
         await trainer.fit()
 
@@ -95,10 +116,10 @@ class TestRLSystem(RLTest):
         config.work_dir = "work_dirs/tests/rl"
         config.async_rollout = "task"
         config.filter_group = "resubmit"
-        for dataset in config.train_datasets:
+        for dataset in config.datasets:
             dataset.infer_args.sample_args["extra_body"] = {"max_entropy": 3}
 
-        trainer = create_trainer(config)
+        trainer = RLTrainer(config)
         await trainer.lazy_init()
         await trainer.fit()
 
@@ -152,15 +173,15 @@ class TestRLSystemQuick(RLTest):
 
         shutil.rmtree("work_dirs/tests/rl", ignore_errors=True)
         config = copy.deepcopy(default_config)
-        config.total_training_steps = 2
+        config.engine_config.train_config.total_training_steps = config.total_training_steps = 2
         config.checkpoint_interval = 1
         config.roll_out_bs = 2
         config.num_rl_group = 8
         config.filter_group = "none"
-        config.loss_func = loss_func
+        config.engine_config.train_config.loss_func = loss_func
         config.data_post_process_func = data_post_process
-        config.step_data_process_func = step_data_process
-        trainer = create_trainer(config)
+        config.engine_config.train_config.step_data_process_func = step_data_process
+        trainer = RLTrainer(config)
         await trainer.lazy_init()
         await trainer.fit()
         for key, used in function_used.items():
@@ -176,10 +197,10 @@ class TestRLSystemQuick(RLTest):
         shutil.rmtree("work_dirs/tests/rl", ignore_errors=True)
         config = copy.deepcopy(self.default_config)
         config.work_dir = "work_dirs/tests/rl"
-        config.total_training_steps = 4
+        config.engine_config.train_config.total_training_steps = config.total_training_steps = 4
         config.roll_out_bs = 4
         config.async_rollout = "task"
-        trainer = create_trainer(config)
+        trainer = RLTrainer(config)
         await trainer.lazy_init()
         await trainer.fit()
         del trainer
@@ -187,15 +208,24 @@ class TestRLSystemQuick(RLTest):
     async def test_agentic_async_rl(self):
         shutil.rmtree("work_dirs/tests/rl", ignore_errors=True)
         config = copy.deepcopy(self.default_config)
-        config.train_datasets = [CountToNDatasetConfig(max_target=32, infer_args=train_infer_args)]
+        train_infer_args, eval_infer_args = copy.deepcopy((TRAIN_INFER_ARGS, EVAL_INFER_ARGS))
+        for infer_args in (train_infer_args, eval_infer_args):
+            infer_args.interactive_mode = True
+            chat_template_kwargs = infer_args.sample_args.setdefault("extra_body", {}).setdefault(
+                "chat_template_kwargs", {}
+            )
+            chat_template_kwargs["thinking"] = True
+
+        config.datasets = [CountToNDatasetConfig(max_target=32, infer_args=train_infer_args)]
         config.train_sample_ratios = [1.0]
         config.eval_datasets = [CountToNDatasetConfig(max_target=32, infer_args=eval_infer_args)]
-        config.eval_sample_ratios = [0.1]
+        config.eval_sample_ratio = [0.1]
         config.work_dir = "work_dirs/tests/rl"
-        config.total_training_steps = 4
-        config.roll_out_bs = 4
+        config.engine_config.train_config.total_training_steps = config.total_training_steps = 4
+        config.roll_out_bs = 2
+        config.num_rl_group = 2
         config.async_rollout = "task"
-        trainer = create_trainer(config)
+        trainer = RLTrainer(config)
         await trainer.lazy_init()
         await trainer.fit()
         await trainer.model_engine.shutdown()
@@ -206,13 +236,13 @@ class TestRLSystemQuick(RLTest):
         shutil.rmtree("work_dirs/tests/rl", ignore_errors=True)
         config = copy.deepcopy(default_config)
         config.llm_config.fsdp_config.train_mesh["mesh_shape"] = (1, 2)
-        config.total_training_steps = 2
+        config.total_training_steps = config.engine_config.train_config.total_training_steps = 2
         config.checkpoint_interval = 1
         config.roll_out_bs = 2
         config.num_rl_group = 8
         config.filter_group = "none"
-        config.num_workers = 2
+        config.engine_config.train_config.num_workers = 2
         config.work_dir = "work_dirs/tests/rl"
-        trainer = create_trainer(config)
+        trainer = RLTrainer(config)
         await trainer.lazy_init()
         await trainer.fit()
