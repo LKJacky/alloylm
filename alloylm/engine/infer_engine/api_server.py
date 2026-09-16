@@ -279,7 +279,7 @@ class APIServer:
         self.thinking_pattern = re.compile(thinking_pattern, re.DOTALL) if thinking_pattern else None
 
         self.cached_infer_info = InferBank()
-        self.in_ray_env = os.environ.get("USE_RAY", "false") == "true"
+        self.in_ray_env = os.environ.get("USE_RAY", "0") == "1"
 
     # session management
 

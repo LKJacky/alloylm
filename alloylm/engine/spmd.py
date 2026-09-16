@@ -128,7 +128,7 @@ class SPMDActor:
                     "WORLD_SIZE": str(spmd_config.world_size),
                     "MASTER_ADDR": master_addr,
                     "MASTER_PORT": str(master_port),
-                    "USE_RAY": "true",
+                    "USE_RAY": "1",
                 }
                 init_refs.append(worker.initialize.remote(envs))
             ray.get(init_refs)
@@ -141,7 +141,7 @@ class SPMDActor:
                     "WORLD_SIZE": str(1),
                     "MASTER_ADDR": "127.0.0.1",
                     "MASTER_PORT": str(get_free_port()),
-                    "USE_RAY": "false",
+                    "USE_RAY": "0",
                 }
             )
             self._workers.append(actor_cls(*args, **kwargs))
