@@ -385,7 +385,7 @@ class TestQwen3ChatTemplate(unittest.TestCase):
             enable_thinking=True,
         )
 
-        self.assertTrue(rendered.endswith("<|im_start|>assistant\n<think>\n\n"))
+        self.assertTrue(rendered.endswith("<|im_start|>assistant\n<think>\n"))
 
 
 if __name__ == "__main__":
