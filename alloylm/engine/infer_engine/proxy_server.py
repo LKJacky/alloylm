@@ -132,7 +132,7 @@ class ProxyServer:
         if not hasattr(self, "interactive_sessions"):
             self.interactive_sessions = {}
         request_content = await request.json()
-        if "session_id" in request_content:
+        if "session_id" in request_content and request_content.get("session_id") != -1:
             session_id = request_content.get("session_id")
             if session_id not in self.interactive_sessions:
                 model_name = request_content.get("model", self.servers.keys().__iter__().__next__())
@@ -141,11 +141,13 @@ class ProxyServer:
             model_name, server_url = self.interactive_sessions[session_id]
         else:
             server_url = None
+            model_name = None
         try:
             return await self.transmit(request, post_url="v1/chat/completions", server_url=server_url)
         finally:
             if server_url is not None and len(request_content["messages"]) == 0:
                 self.release_server_url(model_name, server_url)
+                self.interactive_sessions.pop(session_id, None)
 
     async def chat_interactive_v1(self, request: Request):
         if not hasattr(self, "interactive_sessions"):

@@ -67,7 +67,7 @@ class BaseAgent:
 
             if not message.tool_calls:
                 break
-            if self.finish_reason != "stop":
+            if self.finish_reason not in {"stop", "tool_calls"}:
                 break
             if sum(self.used_tokens) >= self.max_tokens:
                 self.finish_reason = "total_length"
