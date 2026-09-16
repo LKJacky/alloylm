@@ -90,6 +90,7 @@ class CountToNTask(Task):
                 f"Inference timeout {task_data.infer_args.sample_args.get('timeout', 'unknow')} seconds"
             ) from e
         finally:
+            await agent.close()
             await client.close()
         return task_data
 
