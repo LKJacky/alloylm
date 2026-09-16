@@ -94,6 +94,10 @@ class GenerateReqInput(BaseModel):
     max_entropy: float | None = 100.0
 
 
+class TextInconsistencyError(RuntimeError):
+    pass
+
+
 class ChatCompletionRequest(BaseModel):
     """Chat completion request."""
 
@@ -137,10 +141,8 @@ class Messages:
         self.cached_text = ""
 
     def render_messages(self, new_messages, for_generate=False, tools=None, thinking=False):
-        self.messages.extend(new_messages)
-        self.formated_messages.extend(new_messages)
-
-        text = self._get_text(add_generation_prompt=for_generate, tools=tools, thinking=thinking)
+        messages = self.messages + new_messages
+        text = self._get_text(messages, add_generation_prompt=for_generate, tools=tools, thinking=thinking)
         if not text.startswith(self.cached_text):
             common_prefix = os.path.commonprefix([self.cached_text, text])[:-20]  # keep some context
             get_logger().critical(
@@ -148,13 +150,17 @@ class Messages:
                 f"new text: {text.removeprefix(common_prefix)}\n"
                 f"cached text: {self.cached_text.removeprefix(common_prefix)}"
             )
-        diff_text = text[len(self.cached_text) :]
-        self.cached_text = text
-        return diff_text
+            raise TextInconsistencyError()
+        else:
+            self.messages.extend(new_messages)
+            self.formated_messages.extend(new_messages)
+            diff_text = text[len(self.cached_text) :]
+            self.cached_text = text
+            return diff_text
 
-    def _get_text(self, add_generation_prompt=True, tools=None, thinking=False):
+    def _get_text(self, messages, add_generation_prompt=True, tools=None, thinking=False):
         return self.chat_template.render(
-            messages=self.messages,
+            messages=messages,
             add_generation_prompt=add_generation_prompt,
             enable_thinking=thinking,
             tools=tools,
@@ -222,7 +228,7 @@ def parse_thinking(text: str, thinking_pattern: re.Pattern) -> tuple[str | None,
 
     payload = match.group(1)
     if payload is not None:
-        return thinking_pattern.sub("", text), payload
+        return thinking_pattern.sub("", text, count=1), payload
     else:
         # thinking pattern is not closed or not properly formatted, assume all content is reasoning content to make sure prefix consistency for chat template
         return "", text
@@ -406,12 +412,35 @@ class APIServer:
         session: SessionItem = self.get_session(request.session_id)
         # get input text
         new_messages = request.messages[len(session.messages.messages) :]
-        text = session.render_messages(
-            new_messages,
-            for_generate=True,
-            tools=request.tools,
-            thinking=gene_config.enable_thinking,
-        )
+        try:
+            text = session.render_messages(
+                new_messages,
+                for_generate=True,
+                tools=request.tools,
+                thinking=gene_config.enable_thinking,
+            )
+        except TextInconsistencyError:
+            await self.release_session(request.session_id, save_infer_info=request.for_training)
+            self.logger.error(f"Text inconsistency error occurred. Releasing session. {request.session_id}")
+            return {
+                "id": str(request.session_id),
+                "object": "chat.completion",
+                "created": 0,
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": [],
+                        "finish_reason": "error",
+                    }
+                ],
+                "usage": {
+                    "completion_tokens": 0,
+                    "prompt_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+
         # generate
         response, input_ids, result = await self.run_infer(session, gene_config, text=text)
         # parse tools

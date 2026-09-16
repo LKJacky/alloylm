@@ -18,10 +18,12 @@ class BaseAgent:
         client: AsyncClient,
         env: BaseEnv = None,
         max_steps: int = 300,
+        max_tokens: int = 128 * 1024,
     ):
         self.client = client
         self.env = env
         self.max_steps = max_steps
+        self.max_tokens = max_tokens
         self.used_tokens = []
         self.finish_reason = "stop"
 
@@ -64,6 +66,11 @@ class BaseAgent:
             self.messages.append(message_data)
 
             if not message.tool_calls:
+                break
+            if self.finish_reason != "stop":
+                break
+            if sum(self.used_tokens) >= self.max_tokens:
+                self.finish_reason = "total_length"
                 break
             else:
                 for call in message.tool_calls:
