@@ -15,6 +15,7 @@ class GeneConfig:
         total_max_length=4096,
         max_entropy=100,
         release_at_once=False,
+        enable_thinking=False,
     ):
         # generate config
         self.temperature = temperature
@@ -26,6 +27,7 @@ class GeneConfig:
         self.total_max_length = total_max_length if total_max_length else 4096  # deal None in apiserver
         self.max_entropy = max_entropy
         self.release_at_once = release_at_once
+        self.enable_thinking = enable_thinking
 
 
 class GatherContext:

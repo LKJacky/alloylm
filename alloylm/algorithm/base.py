@@ -40,7 +40,7 @@ class InferArgs(BaseModel):
         )
         sample_args = {**self.sample_args}
         if self.interactive_mode:
-            sample_args["extra_body"] = {**sample_args["extra_body"], "session_id": uuid.uuid4().int}
+            sample_args["extra_body"] = {**sample_args.get("extra_body", {}), "session_id": uuid.uuid4().int}
         client.chat.completions.create = partial(client.chat.completions.create, model=self.model_name, **sample_args)
         if self.interactive_mode:
             original_close = client.close

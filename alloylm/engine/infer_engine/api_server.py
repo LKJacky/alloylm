@@ -395,6 +395,7 @@ class APIServer:
             stop_token=request.stop,
             max_entropy=request.max_entropy,
             release_at_once=release_at_once,
+            enable_thinking=self.thinking_pattern is not None and request.chat_template_kwargs.get("thinking", False),
         )
 
         session: SessionItem = self.get_session(request.session_id)
@@ -404,15 +405,15 @@ class APIServer:
             new_messages,
             for_generate=True,
             tools=request.tools,
-            thinking=request.chat_template_kwargs.get("thinking", False),
+            thinking=gene_config.enable_thinking,
         )
         # generate
         response, input_ids, result = await self.run_infer(session, gene_config, text=text)
         # parse tools
-        if self.thinking_pattern:
-            response_wo_think, thinking_content = parse_thinking(response, thinking_pattern=self.thinking_pattern)
+        if gene_config.enable_thinking:
+            response_wo_think, reasoning_content = parse_thinking(response, thinking_pattern=self.thinking_pattern)
         else:
-            response_wo_think, thinking_content = response, None
+            response_wo_think, reasoning_content = response, None
         if self.tool_pattern:
             response_wo_tools, tool_calls = parse_tool_calls(response_wo_think, tool_pattern=self.tool_pattern)
         else:
@@ -422,15 +423,15 @@ class APIServer:
             "role": "assistant",
             "content": response_wo_tools,
         }
-        if thinking_content:
-            message["thinking_content"] = thinking_content
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
         if tool_calls:
             message["tool_calls"] = tool_calls
 
         # update session
         session.messages.cached_text += response
         session.messages.messages.append(
-            {"role": "assistant", "content": response_wo_think, "reasoning_content": thinking_content}
+            {"role": "assistant", "content": response_wo_think, "reasoning_content": reasoning_content}
         )  # do not parse tools, because they are not reversible
         session.messages.formated_messages.append(message)
 
