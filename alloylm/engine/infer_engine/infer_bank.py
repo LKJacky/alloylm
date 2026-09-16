@@ -4,6 +4,8 @@ from collections import OrderedDict
 
 import ray
 
+from alloylm.utils import get_logger
+
 
 class InferBank:
     #  save inference information (input_ids, labels, etc.) for each inference request
@@ -11,13 +13,19 @@ class InferBank:
         self.bank = OrderedDict()
         self.max_num_items = max_num_items
 
-    def update(self, infer_info: dict):
-        # update the bank with new inference information
-        for key, value in infer_info.items():
-            self.bank[key] = value
-            if len(self.bank) > self.max_num_items:
-                obj = self.bank.popitem(last=False)
-                ray.internal.free(obj[1])  # release the memory of the object
+    def add_raw(self, key, value):
+        self.bank[key] = value
+        if len(self.bank) > self.max_num_items:
+            _, obj = self.bank.popitem(last=False)
+            get_logger().warning(
+                f"InferBank reached its {self.max_num_items}-item capacity; evicting the oldest entry"
+            )
+            if isinstance(obj, ray.ObjectRef):
+                ray.internal.free(obj)
+
+    def add(self, messages, info: dict):
+        key = self.hash_messages(messages)
+        self.add_raw(key, info)
 
     def retrieve_infer_info(self, messages):
         key = self.hash_messages(messages)

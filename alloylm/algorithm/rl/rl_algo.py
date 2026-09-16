@@ -461,6 +461,15 @@ class TrainTask(Task):
     def resume(self, state):
         self.task_sampler.resume(state)
 
+    async def shutdown(self):
+        for future in self.running_futures:
+            future.cancel()
+        results = await asyncio.gather(*self.running_futures, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                get_logger().error(f"Rollout task failed during shutdown: {result}")
+        self.running_futures.clear()
+
 
 class SingleEvalTask(Task):
     def __init__(self, dataset: list[Dataset], sample_ratio=1):
@@ -639,6 +648,9 @@ class RLAlgorithm:
         async with aiofiles.open(os.path.join(folder, "algo.json"), "w") as f:
             await f.write(json.dumps(data))
 
+    async def shutdown(self):
+        await self.train_task.shutdown()
+
     # internal
 
     def log_data(self, data: list[TaskData], step, key):
@@ -789,6 +801,8 @@ class RLTrainer:
             for key, t in timer.summary().items():
                 self.tb_writer.add_scalar(f"Time/{key}", t, step)
             self.logger.info("----------------------------\n\n")
+        await self.model_engine.serve()  # start server because the algorithm needs to clean sessions
+        await self.algorithm.shutdown()
         await self.model_engine.stop_serve()
 
     async def checkpoint(self, step):

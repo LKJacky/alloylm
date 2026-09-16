@@ -278,7 +278,8 @@ class APIServer:
         self.tool_pattern = re.compile(tool_pattern, re.DOTALL) if tool_pattern else None
         self.thinking_pattern = re.compile(thinking_pattern, re.DOTALL) if thinking_pattern else None
 
-        self.cached_infer_info = {}
+        self.cached_infer_info = InferBank()
+        self.in_ray_env = os.environ.get("USE_RAY", "false") == "true"
 
     # session management
 
@@ -297,12 +298,13 @@ class APIServer:
                 await self.run_on_engine(ResetItem(session.session_id))
             if save_infer_info:
                 # save training data to ray object store for later training
-                self.cached_infer_info[InferBank.hash_messages(session.messages.formated_messages)] = ray.put(
-                    {
-                        "input_ids": session.training_input_ids,
-                        "labels": session.training_labels,
-                        "inference_logprobs": session.training_logprobs,
-                    }
+                infer_info = {
+                    "input_ids": session.training_input_ids,
+                    "labels": session.training_labels,
+                    "inference_logprobs": session.training_logprobs,
+                }
+                self.cached_infer_info.add(
+                    session.messages.formated_messages, ray.put(infer_info) if self.in_ray_env else infer_info
                 )
 
     # apis

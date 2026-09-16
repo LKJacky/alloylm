@@ -143,8 +143,8 @@ class InferEngine:
         await self.api_server.wait_closed()
 
     def fetch_infer_info(self):
-        cached_infer_info = self.api_server.cached_infer_info.copy()
-        self.api_server.cached_infer_info.clear()
+        cached_infer_info = self.api_server.cached_infer_info.bank.copy()
+        self.api_server.cached_infer_info.bank.clear()
         return cached_infer_info
 
 

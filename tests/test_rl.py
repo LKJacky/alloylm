@@ -1,5 +1,6 @@
 import copy
 import os
+import random
 import shutil
 import unittest
 
@@ -16,7 +17,7 @@ from alloylm.algorithm.rl.rl_config import (
 )
 from alloylm.engine.model import AlloyLMModelConfig
 from alloylm.engine.train_engine.utils import FSDPConfig
-from alloylm.impl.count_to_n import CountToNDatasetConfig
+from alloylm.impl.count_to_n import CountToNDatasetConfig, CountToNTask
 from alloylm.impl.engines.qwen.chat_template import (
     QWEN_THINKING_PATTERN,
     QWEN_TOOL_PATTERN,
@@ -92,6 +93,13 @@ default_config = RLAlgorithmConfig(
     work_dir="work_dirs/tests/rl/",
     max_concurrency=64,
 )
+
+
+class RandomMetricCountToNTask(CountToNTask):
+    @classmethod
+    async def eval(cls, task_data):
+        task_data.metric = random.choice([0, 1])
+        return task_data
 
 
 class RLTest(CudaAsyncTestCase):
@@ -216,9 +224,13 @@ class TestRLSystemQuick(RLTest):
             )
             chat_template_kwargs["thinking"] = True
 
-        config.datasets = [CountToNDatasetConfig(max_target=32, infer_args=train_infer_args)]
+        config.datasets = [
+            CountToNDatasetConfig(max_target=32, infer_args=train_infer_args, task_cls=RandomMetricCountToNTask)
+        ]
         config.train_sample_ratios = [1.0]
-        config.eval_datasets = [CountToNDatasetConfig(max_target=32, infer_args=eval_infer_args)]
+        config.eval_datasets = [
+            CountToNDatasetConfig(max_target=32, infer_args=eval_infer_args, task_cls=RandomMetricCountToNTask)
+        ]
         config.eval_sample_ratio = [0.1]
         config.work_dir = "work_dirs/tests/rl"
         config.engine_config.train_config.total_training_steps = config.total_training_steps = 4
@@ -228,7 +240,6 @@ class TestRLSystemQuick(RLTest):
         trainer = RLTrainer(config)
         await trainer.lazy_init()
         await trainer.fit()
-        await trainer.model_engine.shutdown()
         del trainer
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "Requires at least 2 GPUs")
