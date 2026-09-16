@@ -209,7 +209,7 @@ def parse_tool_calls(text: str, tool_pattern: re.Pattern) -> tuple[str, list[dic
                 }
             )
         content = tool_pattern.sub("", text).strip()
-        return content or None, tool_calls
+        return content, tool_calls
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return text, []
 
@@ -218,14 +218,14 @@ def parse_thinking(text: str, thinking_pattern: re.Pattern) -> tuple[str | None,
     try:
         match = next(thinking_pattern.finditer(text))
     except StopIteration:
-        return None, text
+        return "", text
 
     payload = match.group(1)
     if payload is not None:
         return thinking_pattern.sub("", text), payload
     else:
         # thinking pattern is not closed or not properly formatted, assume all content is reasoning content to make sure prefix consistency for chat template
-        return None, text
+        return "", text
 
 
 # server
