@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -286,6 +287,7 @@ class APIServer:
 
         self.cached_infer_info = InferBank()
         self.in_ray_env = os.environ.get("USE_RAY", "0") == "1"
+        self.running_session = set()
 
     # session management
 
@@ -367,6 +369,15 @@ class APIServer:
 
         self.logger.info(f"API server launched successfully on port {self.port}")
 
+    @contextlib.contextmanager
+    def run_session(self, session_id):
+        assert session_id not in self.running_session, f"Session {session_id} is already running"
+        self.running_session.add(session_id)
+        try:
+            yield
+        finally:
+            self.running_session.discard(session_id)
+
     async def chat_completion(self, request: ChatCompletionRequest):
         request.clean()
         if request.session_id == -1:
@@ -394,113 +405,114 @@ class APIServer:
                         "total_tokens": 0,
                     },
                 }
-
-        gene_config = GeneConfig(
-            top_p=request.top_p,
-            temperature=request.temperature,
-            total_max_length=request.max_completion_tokens,
-            top_k=request.top_k,
-            stop_token=request.stop,
-            max_entropy=request.max_entropy,
-            release_at_once=release_at_once,
-            enable_thinking=self.thinking_pattern is not None and request.chat_template_kwargs.get("thinking", False),
-        )
-        self.logger.info(
-            f"Get a request, temp: {gene_config.temperature}, top_p: {gene_config.top_p}, top_k: {gene_config.top_k}, thinking: {gene_config.enable_thinking}, training: {request.for_training}, interactive: {release_at_once is False}"
-        )
-
-        session: SessionItem = self.get_session(request.session_id)
-        # get input text
-        new_messages = request.messages[len(session.messages.messages) :]
-        try:
-            text = session.render_messages(
-                new_messages,
-                for_generate=True,
-                tools=request.tools,
-                thinking=gene_config.enable_thinking,
+        with self.run_session(request.session_id):
+            gene_config = GeneConfig(
+                top_p=request.top_p,
+                temperature=request.temperature,
+                total_max_length=request.max_completion_tokens,
+                top_k=request.top_k,
+                stop_token=request.stop,
+                max_entropy=request.max_entropy,
+                release_at_once=release_at_once,
+                enable_thinking=self.thinking_pattern is not None
+                and request.chat_template_kwargs.get("thinking", False),
             )
-        except TextInconsistencyError:
-            await self.release_session(request.session_id, save_infer_info=request.for_training)
-            self.logger.error(f"Text inconsistency error occurred. Releasing session. {request.session_id}")
+            self.logger.info(
+                f"Get a request, temp: {gene_config.temperature}, top_p: {gene_config.top_p}, top_k: {gene_config.top_k}, thinking: {gene_config.enable_thinking}, training: {request.for_training}, interactive: {release_at_once is False}"
+            )
+
+            session: SessionItem = self.get_session(request.session_id)
+            # get input text
+            new_messages = request.messages[len(session.messages.messages) :]
+            try:
+                text = session.render_messages(
+                    new_messages,
+                    for_generate=True,
+                    tools=request.tools,
+                    thinking=gene_config.enable_thinking,
+                )
+            except TextInconsistencyError:
+                await self.release_session(request.session_id, save_infer_info=request.for_training)
+                self.logger.error(f"Text inconsistency error occurred. Releasing session. {request.session_id}")
+                return {
+                    "id": str(request.session_id),
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": request.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": [],
+                            "finish_reason": "error",
+                        }
+                    ],
+                    "usage": {
+                        "completion_tokens": 0,
+                        "prompt_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                }
+
+            # generate
+            response, input_ids, result = await self.run_infer(session, gene_config, text=text)
+            # parse tools
+            if gene_config.enable_thinking:
+                response_wo_think, reasoning_content = parse_thinking(response, thinking_pattern=self.thinking_pattern)
+            else:
+                response_wo_think, reasoning_content = response, None
+            if self.tool_pattern:
+                response_wo_tools, tool_calls = parse_tool_calls(response_wo_think, tool_pattern=self.tool_pattern)
+            else:
+                response_wo_tools, tool_calls = response_wo_think, []
+
+            message = {
+                "role": "assistant",
+                "content": response_wo_tools,
+            }
+            if reasoning_content:
+                message["reasoning_content"] = reasoning_content
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+
+            # update session
+            session.messages.cached_text += response
+            session.messages.messages.append(
+                {"role": "assistant", "content": response_wo_think, "reasoning_content": reasoning_content}
+            )  # do not parse tools, because they are not reversible
+            session.messages.formated_messages.append(message)
+
+            if request.for_training:
+                output_ids = result["tokens"]
+                session.training_input_ids.extend(input_ids + output_ids)
+                session.training_labels.extend([-100] * len(input_ids) + output_ids)
+                session.training_logprobs.extend([0] * len(input_ids) + result["log_prob"])
+            if release_at_once:
+                await self.release_session(
+                    session.session_id, release_cache=False, save_infer_info=request.for_training
+                )  # cache had been released
+
             return {
-                "id": str(request.session_id),
+                "id": str(session.session_id),
                 "object": "chat.completion",
                 "created": 0,
                 "model": request.model,
                 "choices": [
                     {
                         "index": 0,
-                        "message": [],
-                        "finish_reason": "error",
+                        "message": message,
+                        "finish_reason": "tool_calls" if tool_calls else result["finish_reason"],
                     }
                 ],
                 "usage": {
-                    "completion_tokens": 0,
-                    "prompt_tokens": 0,
-                    "total_tokens": 0,
+                    "completion_tokens": result["usage"]["output_tokens"],
+                    "prompt_tokens": result["usage"]["history_tokens"] + result["usage"]["input_tokens"],
+                    "total_tokens": (
+                        result["usage"]["history_tokens"]
+                        + result["usage"]["input_tokens"]
+                        + result["usage"]["output_tokens"]
+                    ),
                 },
             }
-
-        # generate
-        response, input_ids, result = await self.run_infer(session, gene_config, text=text)
-        # parse tools
-        if gene_config.enable_thinking:
-            response_wo_think, reasoning_content = parse_thinking(response, thinking_pattern=self.thinking_pattern)
-        else:
-            response_wo_think, reasoning_content = response, None
-        if self.tool_pattern:
-            response_wo_tools, tool_calls = parse_tool_calls(response_wo_think, tool_pattern=self.tool_pattern)
-        else:
-            response_wo_tools, tool_calls = response_wo_think, []
-
-        message = {
-            "role": "assistant",
-            "content": response_wo_tools,
-        }
-        if reasoning_content:
-            message["reasoning_content"] = reasoning_content
-        if tool_calls:
-            message["tool_calls"] = tool_calls
-
-        # update session
-        session.messages.cached_text += response
-        session.messages.messages.append(
-            {"role": "assistant", "content": response_wo_think, "reasoning_content": reasoning_content}
-        )  # do not parse tools, because they are not reversible
-        session.messages.formated_messages.append(message)
-
-        if request.for_training:
-            output_ids = result["tokens"]
-            session.training_input_ids.extend(input_ids + output_ids)
-            session.training_labels.extend([-100] * len(input_ids) + output_ids)
-            session.training_logprobs.extend([0] * len(input_ids) + result["log_prob"])
-        if release_at_once:
-            await self.release_session(
-                session.session_id, release_cache=False, save_infer_info=request.for_training
-            )  # cache had been released
-
-        return {
-            "id": str(session.session_id),
-            "object": "chat.completion",
-            "created": 0,
-            "model": request.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": message,
-                    "finish_reason": "tool_calls" if tool_calls else result["finish_reason"],
-                }
-            ],
-            "usage": {
-                "completion_tokens": result["usage"]["output_tokens"],
-                "prompt_tokens": result["usage"]["history_tokens"] + result["usage"]["input_tokens"],
-                "total_tokens": (
-                    result["usage"]["history_tokens"]
-                    + result["usage"]["input_tokens"]
-                    + result["usage"]["output_tokens"]
-                ),
-            },
-        }
 
     async def chat_interactive(self, request: InteractiveRequest):
         try:
