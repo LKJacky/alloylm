@@ -90,9 +90,9 @@ class Qwen3ChatTemplate:
                 #     output.append(f"<|im_start|>assistant\n{content}")
 
                 if reasoning_content:
-                    output.append(f"<|im_start|>assistant\n<think>{reasoning_content}</think>{content}")
+                    output.append(f"<|im_start|>assistant\n<think>\n{reasoning_content}</think>{content}")
                 else:
-                    output.append(f"<|im_start|>assistant\n<think></think>{content}")
+                    output.append(f"<|im_start|>assistant\n<think>\n</think>{content}")
 
                 ###############################################################################
 
@@ -122,10 +122,10 @@ class Qwen3ChatTemplate:
         if add_generation_prompt:
             output.append("<|im_start|>assistant\n")
             if enable_thinking is False:
-                output.append("<think></think>")
+                output.append("<think>\n</think>")
             # + ###########################################################
             else:
-                output.append("<think>")
+                output.append("<think>\n")
             ###############################################################
 
         return "".join(output)
