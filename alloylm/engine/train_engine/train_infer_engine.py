@@ -199,14 +199,6 @@ class SpmdTrainInferEngine:
     async def lazy_init(self):
         await self.actor.lazy_init()
 
-    def _get_infer_info_ref(self, rl_data: RLInput):
-        infer_info = rl_data.get("infer_info")
-        if infer_info is None:
-            infer_info = self.infer_bank.retrieve_infer_info(rl_data["messages"])
-        if infer_info is None:
-            raise KeyError(f"No inference information found for messages: {rl_data['messages']!r}")
-        return infer_info
-
     async def train_wrapper(self, batch: list[RLInput], step):
         train_data = []
         for rl_data in batch:
@@ -214,7 +206,7 @@ class SpmdTrainInferEngine:
             if infer_info:
                 train_data.append(
                     {
-                        "infer_info": self._get_infer_info_ref(rl_data),
+                        "infer_info": infer_info,
                         "advantages": rl_data["advantages"],
                         "id": uuid.uuid4().hex,
                     }
