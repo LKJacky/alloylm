@@ -120,7 +120,8 @@ class TrainInferEngine:
     def step(self, batch, step):
         for i, item in enumerate(batch):
             infer_info = item.pop("infer_info")
-            infer_info = ray.get(item.pop("infer_info")) if isinstance(infer_info, ray.ObjectRef) else infer_info
+            if isinstance(infer_info, ray.ObjectRef):
+                infer_info = ray.get(infer_info)
             batch[i] = {**item, **infer_info, "num_tokens": len(infer_info["input_ids"])}
         if dist.get_rank() == 0 and step == 0 and batch:
             input_text = self.tokenizer.decode(batch[0]["input_ids"], skip_special_tokens=False)
