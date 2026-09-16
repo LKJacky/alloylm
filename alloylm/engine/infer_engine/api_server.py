@@ -399,6 +399,9 @@ class APIServer:
             release_at_once=release_at_once,
             enable_thinking=self.thinking_pattern is not None and request.chat_template_kwargs.get("thinking", False),
         )
+        self.logger.info(
+            f"Get a request, temp: {gene_config.temperature}, top_p: {gene_config.top_p}, top_k: {gene_config.top_k}, thinking: {gene_config.enable_thinking}, training: {request.for_training}, interactive: {release_at_once is False}"
+        )
 
         session: SessionItem = self.get_session(request.session_id)
         # get input text
