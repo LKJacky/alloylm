@@ -13,6 +13,7 @@ from alloylm.impl.engines.qwen.qwen2_modeling2 import (
 )
 from alloylm.impl.engines.qwen.swa_cache import SwaCacheManager
 from alloylm.test_utils import CudaAsyncTestCase, collect_garbage
+from alloylm.utils import get_logger
 
 
 class SequenceParallelModel:
@@ -259,6 +260,21 @@ class TestQwenModel(CudaAsyncTestCase):
             await model.close()
         finally:
             model.shutdown()
+
+    async def test_window_size(self):
+        window_size = 4096
+        model = FSDPQwen2ForCausalLM.from_pretrained(
+            self.model_path,
+            fsdp_config=FSDPConfig(
+                train_mesh={"device_type": "cuda", "mesh_shape": (1, 1), "mesh_dim_names": ["fsdp", "sp"]},
+                infer_mesh={"device_type": "cuda", "mesh_shape": (1, 1), "mesh_dim_names": ["dp", "tp"]},
+                lm_head_dtype=torch.bfloat16,
+            ),
+            window_size=window_size,
+        )
+        model_str = str(model)
+        get_logger().info(model_str)
+        self.assertTrue("window size=4096" in model_str)
 
 
 class TestQwen3ChatTemplate(unittest.TestCase):
