@@ -2,6 +2,7 @@ import copy
 import re
 import unittest
 
+import flashinfer
 import torch
 from transformers import AutoTokenizer
 
@@ -308,6 +309,53 @@ class TestKernel(CudaAsyncTestCase):
         # position 4096 attends positions 1..4096 and must exclude position 0.
         torch.testing.assert_close(output[-2].float(), torch.full_like(output[-2].float(), 0.5))
         torch.testing.assert_close(output[-1].float(), torch.zeros_like(output[-1].float()))
+
+    def test_flashinfer_prefill_window_size_4096(self):
+        window_size = 4096
+        sequence_length = window_size + 1
+        head_dim = 64
+
+        query = torch.zeros(sequence_length, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+        key = torch.zeros_like(query)
+        value = torch.zeros_like(query)
+        value[0] = window_size / 2
+
+        output = flashinfer.single_prefill_with_kv_cache(
+            query,
+            key,
+            value,
+            causal=True,
+            window_left=window_size - 1,
+        )
+
+        torch.testing.assert_close(output[-2].float(), torch.full_like(output[-2].float(), 0.5))
+        torch.testing.assert_close(output[-1].float(), torch.zeros_like(output[-1].float()))
+
+    def test_flashinfer_decode_window_size_4096(self):
+        window_size = 4096
+        sequence_length = window_size + 1
+        head_dim = 64
+
+        query = torch.zeros(1, head_dim, device="cuda", dtype=torch.bfloat16)
+        key = torch.zeros(sequence_length, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+        value = torch.zeros_like(key)
+        value[0] = window_size / 2
+
+        included = flashinfer.single_decode_with_kv_cache(
+            query,
+            key[:-1],
+            value[:-1],
+            window_left=window_size - 1,
+        )
+        excluded = flashinfer.single_decode_with_kv_cache(
+            query,
+            key,
+            value,
+            window_left=window_size - 1,
+        )
+
+        torch.testing.assert_close(included.float(), torch.full_like(included.float(), 0.5))
+        torch.testing.assert_close(excluded.float(), torch.zeros_like(excluded.float()))
 
 
 class TestQwen3ChatTemplate(unittest.TestCase):

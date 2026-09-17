@@ -1074,7 +1074,7 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
             head_dim_qk=attention_args.kv_cache.shape[-1],
             page_size=cache.block_size,
             causal=True,
-            window_left=self.config.ws[0] if self.config.use_sliding_window else -1,
+            window_left=self.config.ws[0] - 1 if self.config.use_sliding_window else -1,
             q_data_type=attention_args.kv_cache.dtype,
             kv_data_type=attention_args.kv_cache.dtype,
         )
@@ -1109,7 +1109,7 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
             num_kv_heads=attention_args.kv_cache.shape[-2],
             head_dim=attention_args.kv_cache.shape[-1],
             page_size=cache.block_size,
-            window_left=self.config.ws[0] if self.config.use_sliding_window else -1,
+            window_left=self.config.ws[0] - 1 if self.config.use_sliding_window else -1,
             q_data_type=attention_args.kv_cache.dtype,
             kv_data_type=attention_args.kv_cache.dtype,
             seq_lens=attention_args.num_cache_tokens,
