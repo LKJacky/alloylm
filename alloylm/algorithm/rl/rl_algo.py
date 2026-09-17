@@ -729,6 +729,7 @@ class RLTrainer:
         self.model_engine = SpmdTrainInferEngine(model_config=config.llm_config, engine_config=config.engine_config)
 
         self.cur_step = 0
+        self.optimization_step = 0
 
         DummySummaryWriter.init_writer(self.config.work_dir)
 
@@ -772,11 +773,22 @@ class RLTrainer:
                 if len(train_data) != 0:
                     with MeasureTime("train"):
                         self.logger.info("**Starting model training...")
-                        train_log = await self.model_engine.train_wrapper(train_data, step)
-                        log_str = ", ".join([f"{k}: {v:.4f}" for k, v in train_log.items()])
-                        self.logger.info(f"**Training step {step} logs: {log_str}")
-                        for k, v in train_log.items():
-                            self.tb_writer.add_scalar(f"{k}", v, step)
+                        batch_info, num_optimization = await self.model_engine.set_rl_data(train_data, step)
+                        for key, value in batch_info.items():
+                            self.tb_writer.add_scalar(key, value, step)
+                        for i in range(num_optimization):
+                            train_log = await self.model_engine.step_rl()
+                            log_str = ", ".join(
+                                [f"{k}: {f'{v:.4f}' if isinstance(v, float) else v}" for k, v in train_log.items()]
+                            )
+                            self.logger.info(
+                                f"**Training step {step} (optimization step {self.optimization_step + i}) logs: {log_str}"
+                            )
+                            for k, v in train_log.items():
+                                self.tb_writer.add_scalar(f"{k}", v, self.optimization_step + i)
+                        self.optimization_step += (
+                            num_optimization  # update when a rl step finished, to make resume work fine.
+                        )
                     self.logger.info("**Model training ends, synchronizing weights...")
                 else:
                     self.logger.warning("No training data received, skipping this step.")
@@ -825,7 +837,14 @@ class RLTrainer:
             shutil.rmtree(step_folder)
             self.logger.info(f"Removed old checkpoint: {step_folder}")
         async with aiofiles.open(os.path.join(self.config.work_dir, "trainer.json"), "w") as f:
-            await f.write(json.dumps({"best_reward": self.best_reward}))
+            await f.write(
+                json.dumps(
+                    {
+                        "best_reward": self.best_reward,
+                        "optimization_step": self.optimization_step,
+                    }
+                )
+            )
 
     async def resume(self):
         def get_ckpt_path_from_work_dir(work_dir):
@@ -851,5 +870,6 @@ class RLTrainer:
                 async with aiofiles.open(trainer_json, mode="r") as f:
                     data = json.loads(await f.read())
                     self.best_reward = data.get("best_reward", -1)
+                    self.optimization_step = data.get("optimization_step", 0)
 
             return True

@@ -257,6 +257,7 @@ class TrainEngine:
 
         self.optimize_steps = 0
         self.start_step = 0
+        self.rl_data: dict[str, Any] | None = None
 
         set_random_seed(self.config.seed)
 
@@ -339,11 +340,10 @@ class TrainEngine:
 
     # training step
 
-    def step(self, batch: list[dict[str, Any]], step):  # step rl
-
-        dataset = TaskDataset(batch)
-        pack_dataset = SoftPackDataset([dataset], target=self.config.max_length)
-        dataloader = DataLoader(
+    def set_rl_data(self, batch: list[dict[str, Any]], step):
+        # build dataset and dataloader
+        pack_dataset = SoftPackDataset([TaskDataset(batch)], target=self.config.max_length)
+        rl_dataloader = DataLoader(
             pack_dataset,
             batch_size=1,
             num_workers=0,
@@ -358,16 +358,33 @@ class TrainEngine:
                 drop_last=False,
             ),
         )
-        dataloader.sampler.set_epoch(0)
-        batch = self.compute_log_prob(batch, dataloader)
+        num_optimization = min(self.config.num_optimize_per_step, len(rl_dataloader))
+        if num_optimization == 0:
+            self.logger.warning("No RL data available after packing; skipping optimization.")
+            self.rl_data = None
+            return {}, 0
+        max_iters_per_step = (len(rl_dataloader) + num_optimization - 1) // num_optimization
+        num_optimization = math.ceil(len(rl_dataloader) / max_iters_per_step)  # recomputed based on max iters per step
 
+        self.logger.info(
+            f"[Train Data] {len(batch)} traj are packed to dataloader {len(rl_dataloader)}. {num_optimization} steps with {max_iters_per_step} iters per step."
+        )
+
+        # compute log probs
+        rl_dataloader.sampler.set_epoch(step)
+        batch = self.compute_log_prob(batch, rl_dataloader)
         batch_info = self._log_logprob_diff(batch)  # only compute logprobs in current rank
 
-        dataloader.sampler.set_epoch(0)
-        self.train_rl_step(batch, step, dataloader, batch_info)
-        batch_info["lr"] = self.optimizer.param_groups[0]["lr"]
+        # save dataloader for training
+        rl_dataloader.sampler.set_epoch(step)
+        self.rl_data = {
+            "data_iter": iter(rl_dataloader),
+            "max_iters_per_step": max_iters_per_step,
+            "batch_info": batch_info,
+            "remaining_steps": num_optimization,
+        }
 
-        return batch_info
+        return batch_info, num_optimization
 
     def set_sft_data(
         self,
@@ -587,186 +604,172 @@ class TrainEngine:
             gc.collect()
             torch.cuda.empty_cache()
 
-    def train_rl_step(
-        self, trajectories: list[dict[str, Any]], rl_step: int, rl_dataloader: DataLoader, batch_info: dict
-    ) -> dict[str, float]:
-        """Train model on collected trajectories using GRPO with varlen
-        support."""
-        self.patched_llm.train()
-
-        # dataset
-        num_steps = min(self.config.num_optimize_per_step, len(rl_dataloader))
-        if num_steps == 0:
-            return num_steps
-        max_iters_per_step = (len(rl_dataloader) + num_steps - 1) // num_steps
-        num_steps = (len(rl_dataloader) + max_iters_per_step - 1) // max_iters_per_step
-
-        data_iter = iter(rl_dataloader)
-        self.logger.info(
-            f"[Train Data] {len(trajectories)} traj are packed to dataloader {len(rl_dataloader)}. {num_steps} steps with {max_iters_per_step} iters per step, "
+    def step_rl(self) -> dict[str, float]:
+        """Train one optimization step on the configured RL data."""
+        if self.rl_data is None:
+            raise RuntimeError("RL data has not been set or has been exhausted; call set_rl_data() first")
+        data_iter, max_iters_per_step, batch_info = (
+            self.rl_data["data_iter"],
+            self.rl_data["max_iters_per_step"],
+            self.rl_data["batch_info"],
         )
 
-        for step_i in range(num_steps):
-            # info
-            step_t0 = time.time()
-            step_policy_loss = 0.0
+        self.patched_llm.train()
 
-            # prepare batch data
-            step_data = []
-            for _ in range(max_iters_per_step):
-                try:
-                    step_data.append(next(data_iter))
-                except StopIteration:
-                    break
+        step_t0 = time.time()
+        step_policy_loss = 0.0
 
-            with torch.no_grad():
-                if self.config.step_data_process_func is not None:
-                    step_data = self.config.step_data_process_func(step_data)
+        # prepare batch data
+        step_data = []
+        for _ in range(max_iters_per_step):
+            try:
+                step_data.append(next(data_iter))
+            except StopIteration:
+                break
 
-            # compute global num tokens
-            with torch.no_grad():
-                global_num_tokens = 0
-                for packed_batch in step_data:
-                    global_num_tokens += (packed_batch["labels"] != -100).sum()
-                global_num_tokens = global_num_tokens.cuda()
-                dist.all_reduce(global_num_tokens, op=dist.ReduceOp.SUM)
+        with torch.no_grad():
+            if self.config.step_data_process_func is not None:
+                step_data = self.config.step_data_process_func(step_data)
 
-                # for per_seq loss
-                # global_num_seq = 0
-                # for packed_batch in step_data:
-                #     global_num_seq += len(packed_batch["num_tokens"])
-                # global_num_seq = torch.tensor(global_num_seq).cuda()
-                # dist.all_reduce(global_num_seq, op=dist.ReduceOp.SUM)
-                # global_reduce_num = global_num_seq
-
-            total_step_entropy = 0
-            total_step_entropy_squared = 0
-            policy_loss_cfg = {
-                "cliprange_high": self.config.h_clip,
-                "cliprange_low": self.config.l_clip,
-                "cliprange_c": 3,
-                **batch_info,
-            }
-            count_small_entropy = 0
+        # compute global num tokens
+        with torch.no_grad():
+            global_num_tokens = 0
             for packed_batch in step_data:
-                # prepare data
-                input_ids = packed_batch["input_ids"].cuda()
-                shift_labels_for_sp = packed_batch["labels"].cuda()
-                advantages_sp = packed_batch["advantages"].cuda()
-                old_log_prob_sp = packed_batch["old_log_probs"].cuda()
-                position_ids = packed_batch["position_ids"].cuda()
-                seq_lens = packed_batch["seq_lens"].cuda()
+                global_num_tokens += (packed_batch["labels"] != -100).sum()
+            global_num_tokens = global_num_tokens.cuda()
+            dist.all_reduce(global_num_tokens, op=dist.ReduceOp.SUM)
 
-                # Chunk mode: monkey-patch lm_head with ChunkLoss
-                # mask is 1D [seq_sp] — excludes both -100 (mask) and SP padding (negative pad values)
-                mask = shift_labels_for_sp[0] >= 0
+            # for per_seq loss
+            # global_num_seq = 0
+            # for packed_batch in step_data:
+            #     global_num_seq += len(packed_batch["num_tokens"])
+            # global_num_seq = torch.tensor(global_num_seq).cuda()
+            # dist.all_reduce(global_num_seq, op=dist.ReduceOp.SUM)
+            # global_reduce_num = global_num_seq
 
-                def _chunk_loss(
-                    hidden_states,
-                    _shift_labels_for_sp=shift_labels_for_sp,
-                    _old_log_prob_sp=old_log_prob_sp,
-                    _advantages_sp=advantages_sp,
-                    _mask=mask,
-                    _global_reduce_num=global_num_tokens,
-                    _policy_loss_cfg=policy_loss_cfg,
-                ):
-                    # Trim hidden_states to match labels (SP padding stripped)
-                    hidden_states = hidden_states[:, : _shift_labels_for_sp.size(1)]
-                    loss, entropy = ChunkLoss.apply(
-                        hidden_states[:, _mask],
-                        self.patched_llm.lm_head.weight,
-                        default_loss_func if self.config.loss_func is None else self.config.loss_func,
-                        [
-                            {
-                                "labels": lc,
-                                "old_logprobs": oc,
-                                "advantages": ac,
-                                "loss_weight": 1.0 / _global_reduce_num,
-                                "policy_loss_cfg": _policy_loss_cfg,
-                            }
-                            for lc, oc, ac in zip(
-                                torch.split(_shift_labels_for_sp[:, _mask], self.config.chunk_loss_size, dim=1),
-                                torch.split(_old_log_prob_sp[:, _mask], self.config.chunk_loss_size, dim=1),
-                                torch.split(_advantages_sp[:, _mask], self.config.chunk_loss_size, dim=1),
-                            )
-                        ],
-                        self.config.chunk_loss_size,
-                        True,
-                    )
-                    return loss, entropy.detach()
+        total_step_entropy = 0
+        total_step_entropy_squared = 0
+        policy_loss_cfg = {
+            "cliprange_high": self.config.h_clip,
+            "cliprange_low": self.config.l_clip,
+            "cliprange_c": 3,
+            **batch_info,
+        }
+        count_small_entropy = 0
+        for packed_batch in step_data:
+            # prepare data
+            input_ids = packed_batch["input_ids"].cuda()
+            shift_labels_for_sp = packed_batch["labels"].cuda()
+            advantages_sp = packed_batch["advantages"].cuda()
+            old_log_prob_sp = packed_batch["old_log_probs"].cuda()
+            position_ids = packed_batch["position_ids"].cuda()
+            seq_lens = packed_batch["seq_lens"].cuda()
 
-                with self._dispatch_lm_head(_chunk_loss):
-                    policy_loss, entropy = self.patched_llm.train_forward(
-                        TrainInput(
-                            input_ids=input_ids,
-                            position_ids=position_ids,
-                            seq_lens=seq_lens.int(),
+            # Chunk mode: monkey-patch lm_head with ChunkLoss
+            # mask is 1D [seq_sp] — excludes both -100 (mask) and SP padding (negative pad values)
+            mask = shift_labels_for_sp[0] >= 0
+
+            def _chunk_loss(
+                hidden_states,
+                _shift_labels_for_sp=shift_labels_for_sp,
+                _old_log_prob_sp=old_log_prob_sp,
+                _advantages_sp=advantages_sp,
+                _mask=mask,
+                _global_reduce_num=global_num_tokens,
+                _policy_loss_cfg=policy_loss_cfg,
+            ):
+                # Trim hidden_states to match labels (SP padding stripped)
+                hidden_states = hidden_states[:, : _shift_labels_for_sp.size(1)]
+                loss, entropy = ChunkLoss.apply(
+                    hidden_states[:, _mask],
+                    self.patched_llm.lm_head.weight,
+                    default_loss_func if self.config.loss_func is None else self.config.loss_func,
+                    [
+                        {
+                            "labels": lc,
+                            "old_logprobs": oc,
+                            "advantages": ac,
+                            "loss_weight": 1.0 / _global_reduce_num,
+                            "policy_loss_cfg": _policy_loss_cfg,
+                        }
+                        for lc, oc, ac in zip(
+                            torch.split(_shift_labels_for_sp[:, _mask], self.config.chunk_loss_size, dim=1),
+                            torch.split(_old_log_prob_sp[:, _mask], self.config.chunk_loss_size, dim=1),
+                            torch.split(_advantages_sp[:, _mask], self.config.chunk_loss_size, dim=1),
                         )
-                    )
-
-                policy_loss = policy_loss * self.num_workers
-                policy_loss.backward()
-
-                with torch.no_grad():
-                    # entropy is already for masked (valid) positions only
-                    step_policy_loss += policy_loss.detach()
-                    total_step_entropy += entropy.sum() / global_num_tokens
-                    total_step_entropy_squared += entropy.pow(2).sum() / global_num_tokens
-                    count_small_entropy += (entropy < 0.1).sum()
-
-            # update parameters
-            grad_norm = clip_grad_norm_([param for param in self.patched_llm.parameters() if param.requires_grad], 1.0)
-            if grad_norm.isnan() or grad_norm.isinf():
-                self.logger.warning(f"[Step {step_i}] The grad norm is NaN or Inf, skip this step.")
-            else:
-                self.optimizer.step()
-            self.optimizer.zero_grad()
-            self.scheduler.step()
-
-            # log per step
-            step_time = time.time() - step_t0
-            reduced_step_policy_loss = step_policy_loss.clone().detach()
-            dist.all_reduce(reduced_step_policy_loss, op=dist.ReduceOp.AVG)
-            dist.all_reduce(total_step_entropy, op=dist.ReduceOp.SUM)
-            dist.all_reduce(total_step_entropy_squared, op=dist.ReduceOp.SUM)
-            dist.all_reduce(count_small_entropy, op=dist.ReduceOp.SUM)
-            entropy_var = (total_step_entropy_squared - total_step_entropy**2).clamp(min=0)
-            entropy_std = torch.sqrt(entropy_var)
-            tgs = int(global_num_tokens.item() / step_time / self.num_workers)
-
-            self.logger.info(
-                f"[RL] (Step {rl_step}) Step "
-                f"{step_i + 1}/{num_steps}  "
-                f"Optimize Step: {self.optimize_steps}  "
-                f"loss: {step_policy_loss:.4f}  "
-                f"loss(reduced): {reduced_step_policy_loss.item():.3f}  "
-                f"entropy: {total_step_entropy:.4f}  "
-                f"entropy_std: {entropy_std:.4f}  "
-                f"small_entropy_ratio: {count_small_entropy.item() / global_num_tokens.item():.4f}  "
-                f"grad_norm: {grad_norm:.2f}  "
-                f"lr: {self.optimizer.param_groups[0]['lr']:.6g}  "
-                f"tgs: {tgs}  "
-                f"tokens: {global_num_tokens.item()}  "
-                f"time: {step_time:.2f}s  "
-                f"Mem: {torch.cuda.max_memory_allocated() / 1024**3:.1f} G  "
-            )
-
-            if self.tb_writer is not None:
-                self.tb_writer.add_scalar("train/policy_loss", reduced_step_policy_loss, self.optimize_steps)
-                self.tb_writer.add_scalar("train/grad_norm", grad_norm, self.optimize_steps)
-                self.tb_writer.add_scalar("train/entropy", total_step_entropy, self.optimize_steps)
-                self.tb_writer.add_scalar("train/entropy_std", entropy_std, self.optimize_steps)
-                self.tb_writer.add_scalar(
-                    "train/small_entropy_ratio",
-                    count_small_entropy.item() / global_num_tokens.item(),
-                    self.optimize_steps,
+                    ],
+                    self.config.chunk_loss_size,
+                    True,
                 )
-                self.tb_writer.add_scalar("train/tgs", tgs, self.optimize_steps)
-                self.tb_writer.add_scalar("train/global_tokens", global_num_tokens.item(), self.optimize_steps)
+                return loss, entropy.detach()
 
-            self.optimize_steps += 1
+            with self._dispatch_lm_head(_chunk_loss):
+                policy_loss, entropy = self.patched_llm.train_forward(
+                    TrainInput(
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                        seq_lens=seq_lens.int(),
+                    )
+                )
+
+            policy_loss = policy_loss * self.num_workers
+            policy_loss.backward()
+
+            with torch.no_grad():
+                # entropy is already for masked (valid) positions only
+                step_policy_loss += policy_loss.detach()
+                total_step_entropy += entropy.sum() / global_num_tokens
+                total_step_entropy_squared += entropy.pow(2).sum() / global_num_tokens
+                count_small_entropy += (entropy < 0.1).sum()
+
+        # update parameters
+        grad_norm = clip_grad_norm_([param for param in self.patched_llm.parameters() if param.requires_grad], 1.0)
+        if grad_norm.isnan() or grad_norm.isinf():
+            self.logger.warning(f"[Step {self.optimize_steps}] The grad norm is NaN or Inf, skip this step.")
+        else:
+            self.optimizer.step()
+        self.optimizer.zero_grad()
+        self.scheduler.step()
+
+        # log per step
+        step_time = time.time() - step_t0
+        reduced_step_policy_loss = step_policy_loss.clone().detach()
+        dist.all_reduce(reduced_step_policy_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(total_step_entropy, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_step_entropy_squared, op=dist.ReduceOp.SUM)
+        dist.all_reduce(count_small_entropy, op=dist.ReduceOp.SUM)
+        entropy_var = (total_step_entropy_squared - total_step_entropy**2).clamp(min=0)
+        entropy_std = torch.sqrt(entropy_var)
+        tgs = int(global_num_tokens.item() / step_time / self.num_workers)
+        train_info = {
+            "step": self.optimize_steps,
+            "loss": reduced_step_policy_loss.item(),
+            "entropy": total_step_entropy.item(),
+            "entropy_std": entropy_std.item(),
+            "small_entropy_ratio": count_small_entropy.item() / global_num_tokens.item(),
+            "grad_norm": grad_norm,
+            "lr": self.optimizer.param_groups[0]["lr"],
+            "tgs": tgs,
+            "tokens": global_num_tokens.item(),
+            "time": step_time,
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+        }
+        log_str = " ".join(f"{k}: {f'{v:.4f}' if isinstance(v, float) else v}" for k, v in train_info.items())
+        self.logger.info(log_str)
+
+        self.optimize_steps += 1
         self.train_state.num_optimize = self.optimize_steps
-        return num_steps
+        self.rl_data["remaining_steps"] -= 1
+        if self.rl_data["remaining_steps"] == 0:
+            self.rl_data = None
+        return train_info
+
+    def step(self, batch: list[dict[str, Any]], step):
+        batch_info, num_steps = self.set_rl_data(batch, step)
+        train_info = {}
+        for _ in range(num_steps):
+            train_info = self.step_rl()
+        return {**batch_info, **train_info}
 
     @torch.inference_mode()
     def compute_log_prob(self, tasks: list[dict[str, Any]], dataloader: DataLoader):
@@ -839,6 +842,7 @@ class TrainEngine:
                 "model": shard_model_state_dict,
                 "optimizer": shard_optimizer_state_dict,
                 "train_state": self.train_state,
+                "scheduler": self.scheduler.state_dict(),
             }
             dcp.load(
                 state_dict=state_dict,
@@ -852,6 +856,7 @@ class TrainEngine:
                 optim_state_dict=state_dict["optimizer"],
                 options=_options,
             )
+            self.scheduler.load_state_dict(state_dict["scheduler"])
         self.start_step = self.train_state.cur_step + 1
         self.optimize_steps = self.train_state.num_optimize
 
@@ -873,6 +878,7 @@ class TrainEngine:
             state_dict = {
                 "model": shard_model_state_dict,
                 "optimizer": shard_optimizer_state_dict,
+                "scheduler": self.scheduler.state_dict(),
                 "train_state": self.train_state.state_dict(),
             }
             os.makedirs(ckpt_dir, exist_ok=True)
