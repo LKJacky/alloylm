@@ -3,7 +3,6 @@ import contextlib
 import json
 import os
 import re
-import traceback
 import uuid
 from queue import Queue
 from typing import Any, Dict, List, Optional, Union  # noqa: UP035
@@ -13,7 +12,7 @@ import jinja2
 import ray
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 from jinja2 import Template
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from openai.types.chat.chat_completion_tool_union_param import (
@@ -26,7 +25,7 @@ from transformers import AutoTokenizer
 from alloylm.engine.train_engine.utils import get_engine_logger as get_logger
 
 from .infer_bank import InferBank
-from .scheduler import InferItem, ReleaseItem, ResetItem, TaskItem
+from .scheduler import InferItem, ResetItem, TaskItem
 from .utils import GeneConfig, get_current_ip
 
 
@@ -321,9 +320,6 @@ class APIServer:
         app = FastAPI(title="OpenAI-compatible API")
 
         app.post("/v1/chat/completions")(self.chat_completion)
-        app.post("/v1/chat/interactive")(self.chat_interactive)
-        app.post("/generate")(self.generate)
-        app.post("/abort_request")(self.abort_request)
         app.get("/health")(self.health)
         app.get("/v1/models")(self.available_models)
 
@@ -513,88 +509,6 @@ class APIServer:
                     ),
                 },
             }
-
-    async def chat_interactive(self, request: InteractiveRequest):
-        try:
-            if request.prompt == "":  # stop session
-                # reset batch
-                await self.release_session(request.session_id)
-                return JSONResponse(
-                    {
-                        "text": "",
-                        "tokens": 0,
-                        "input_tokens": 0,
-                        "history_tokens": 0,
-                        "finish_reason": "stop",
-                    }
-                )
-            else:
-                if isinstance(request.prompt, str):
-                    messages = [{"role": "user", "content": request.prompt}]
-                else:
-                    messages = request.prompt
-
-                gene_config = GeneConfig(
-                    top_p=request.top_p,
-                    temperature=request.temperature,
-                    total_max_length=request.request_output_len,
-                    top_k=request.top_k,
-                    stop_token=request.stop,
-                )
-                session = self.get_session(request.session_id)
-                text = session.render_messages(messages, True)
-                response, input_ids, result = await self.run_infer(session, gene_config, text=text)
-
-                session.render_messages([{"role": "assistant", "content": response}], False)
-
-                return JSONResponse(
-                    {
-                        "text": response,
-                        "tokens": len(result["tokens"]),
-                        "input_tokens": len(input_ids),
-                        "history_tokens": result["usage"]["history_tokens"],
-                        "finish_reason": result["finish_reason"],
-                    }
-                )
-        except Exception as e:  # noqa
-            self.logger.error(f"Error in chat_interactive: {e}\n{traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail=str(e) + "\n" + traceback.format_exc())
-
-    async def generate(self, request: GenerateReqInput):
-        session_id = (
-            uuid.uuid4().int if request.session_id == -1 else request.session_id
-        )  # release session by interactive api
-        session = self.get_session(session_id)
-
-        gene_config = GeneConfig(
-            top_p=request.top_p,
-            temperature=request.temperature,
-            total_max_length=request.max_tokens,
-            top_k=request.top_k,
-            stop_token=request.stop,
-            max_entropy=request.max_entropy,
-        )
-
-        response, _, result = await self.run_infer(session, gene_config, input_tokens=request.input_ids)
-
-        if request.session_id == -1:
-            await self.release_session(session_id)
-
-        return {
-            "output_ids": result["tokens"],
-            "text": response,
-            "meta_info": {
-                "output_token_logprobs": [(x,) for x in result["log_prob"]],
-                "entropy": result["entropy"],
-                "finish_reason": {"type": result["finish_reason"]},
-            },
-        }
-
-    async def abort_request(self, request: dict | None = None):
-        if request is None:
-            request = {}
-        await self.run_on_engine(ReleaseItem(-1))
-        return {"status": "success"}
 
     # apis for proxy
 
