@@ -121,9 +121,9 @@ class TrainInferEngine:
                 infer_info = ray.get(infer_info)
             batch[i] = {**item, **infer_info, "num_tokens": len(infer_info["input_ids"])}
         if dist.get_rank() == 0 and step == 0 and batch:
-            input_text = self.tokenizer.decode(batch[0]["input_ids"], skip_special_tokens=False)
+            input_text = self.tokenizer.decode(batch[-1]["input_ids"], skip_special_tokens=False)
             labels_text = self.tokenizer.decode(
-                [token_id for token_id in batch[0]["labels"] if token_id != -100],
+                [token_id for token_id in batch[-1]["labels"] if token_id != -100],
                 skip_special_tokens=False,
             )
             with open(os.path.join(self.args.work_dir, "train_sample.txt"), "w", encoding="utf-8") as f:

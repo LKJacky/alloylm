@@ -448,7 +448,7 @@ class APIServer:
                 }
 
             # generate
-            response, input_ids, result = await self.run_infer(session, gene_config, text=text)
+            response, stop_text, input_ids, result = await self.run_infer(session, gene_config, text=text)
             # parse tools
             if gene_config.enable_thinking:
                 response_wo_think, reasoning_content = parse_thinking(response, thinking_pattern=self.thinking_pattern)
@@ -469,7 +469,7 @@ class APIServer:
                 message["tool_calls"] = tool_calls
 
             # update session
-            session.messages.cached_text += response
+            session.messages.cached_text += response + stop_text
             session.messages.messages.append(
                 {"role": "assistant", "content": response_wo_think, "reasoning_content": reasoning_content}
             )  # do not parse tools, because they are not reversible
@@ -565,14 +565,21 @@ class APIServer:
         else:
             infer_item = InferItem(session.session_id, input_tokens, gene_config)
             result = await self.run_on_engine(infer_item)
+            if result["finish_reason"] == "stop":
+                decode_text = await asyncio.get_running_loop().run_in_executor(
+                    None, self.tokenizer.decode, result["tokens"][:-1]
+                )
+                stop_text = await asyncio.get_running_loop().run_in_executor(
+                    None, self.tokenizer.decode, result["tokens"][-1:]
+                )
+            else:
+                decode_text = await asyncio.get_running_loop().run_in_executor(
+                    None, self.tokenizer.decode, result["tokens"]
+                )
+                stop_text = ""
 
-            decode_text = await asyncio.get_running_loop().run_in_executor(
-                None,
-                self.tokenizer.decode,
-                result["tokens"][:-1] if result["finish_reason"] == "stop" else result["tokens"],
-            )
             session.forward_tokens(len(input_tokens) + len(result["tokens"]))
-            return decode_text, input_tokens, result
+            return decode_text, stop_text, input_tokens, result
 
     async def tokenize_stop_tokens(self, gene_config: GeneConfig):
         gene_config.stop_token = [
