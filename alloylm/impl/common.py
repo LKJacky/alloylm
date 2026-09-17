@@ -54,7 +54,13 @@ class OneStepTask(Task):
         client = task_data.infer_args.get_client(client_type=AsyncClient)
         try:
             response = await client.chat.completions.create(messages=task_data.messages)
-            task_data.messages.append({"role": "assistant", "content": response.choices[0].message.content})
+            new_message = response.choices[0].message
+            message_data = {"role": new_message.role, "content": new_message.content}
+            if new_message.tool_calls:
+                message_data["tool_calls"] = [call.model_dump(exclude_none=True) for call in new_message.tool_calls]
+            if hasattr(new_message, "reasoning_content") and new_message.reasoning_content:
+                message_data["reasoning_content"] = new_message.reasoning_content
+            task_data.messages.append(message_data)
 
             task_data.finish_reason = response.choices[0].finish_reason
             task_data.input_tokens = response.usage.prompt_tokens
