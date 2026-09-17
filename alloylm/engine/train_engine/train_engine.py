@@ -328,9 +328,9 @@ class TrainEngine:
             return min_ratio + (1 - min_ratio) * (1 + math.cos(math.pi * progress)) / 2
 
         if self.config.scheduler_type == "cosine":
-            self.cosine_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, cos_lr_lambda)
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, cos_lr_lambda)
         else:
-            self.cosine_scheduler = ConstantLR(
+            self.scheduler = ConstantLR(
                 optimizer=self.optimizer, factor=1
             )  # TODO: support both cosine scheduler and constant scheduler
 
@@ -471,7 +471,7 @@ class TrainEngine:
         else:
             self.optimizer.step()
         self.optimizer.zero_grad()
-        self.cosine_scheduler.step()
+        self.scheduler.step()
 
         # reduce loss across dp ranks for logging
         reduced_loss = torch.tensor(step_loss, device="cuda")
@@ -721,6 +721,7 @@ class TrainEngine:
             else:
                 self.optimizer.step()
             self.optimizer.zero_grad()
+            self.scheduler.step()
 
             # log per step
             step_time = time.time() - step_t0

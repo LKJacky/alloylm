@@ -5,10 +5,8 @@ import os
 import uuid
 from collections.abc import Callable
 
-import jinja2
 import ray
 import torch
-from jinja2.sandbox import ImmutableSandboxedEnvironment
 from pydantic import BaseModel
 from torch import distributed as dist
 from transformers import AutoTokenizer
@@ -22,8 +20,6 @@ from alloylm.engine.train_engine.utils import (
 )
 
 from ..infer_engine.infer_bank import InferBank
-from .hack_client import HighConcurrentClient as AsyncClient
-from .hack_client import HighConcurrentClientInteractive as AsyncClientInteractive
 from .train_engine import RLInput, TrainEngine, TrainEngineConfig
 from .utils import engine_logger_name
 
@@ -180,18 +176,6 @@ class SpmdTrainInferEngine:
                 memory=16 * 1024**3,
             ),
         )
-
-        self.activate_server_event = asyncio.Event()
-        AsyncClient.tokenizer = self.tokenizer
-        jinja_env = ImmutableSandboxedEnvironment(
-            trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols]
-        )
-        AsyncClient.chat_template = jinja_env.from_string(self.tokenizer.get_chat_template())
-        AsyncClient.server_activate_event = self.activate_server_event
-
-        AsyncClientInteractive.chat_template = AsyncClient.chat_template
-        AsyncClientInteractive.server_activate_event = self.activate_server_event
-        AsyncClientInteractive.tokenizer = self.tokenizer
 
         self.infer_bank = InferBank()
         self.url = None
