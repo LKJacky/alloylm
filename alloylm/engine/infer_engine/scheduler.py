@@ -44,7 +44,7 @@ class InferItem(TaskItem):
     def should_stop(self):
         if len(self.device_session.tokens) > 0 and self.device_session.tokens[-1] in self.gene_config.stop_token:
             return "stop"
-        elif (self.device_session.total_num_tokens() - self.num_init_tokens) >= self.gene_config.total_max_length:
+        elif self.device_session.total_num_tokens() >= self.gene_config.total_max_length:
             return "length"
         elif self.device_session.entropy[-1] >= self.gene_config.max_entropy:
             return "entropy"
