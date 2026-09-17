@@ -74,6 +74,7 @@ class TrainInferEngine:
             self.tokenizer,
             config=self.args.train_config,
         )
+        self.logger.info(f"TrainInferEngine initialized. with {self.model}")
 
     async def lazy_init(self):
         pass
