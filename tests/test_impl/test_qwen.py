@@ -7,6 +7,7 @@ from transformers import AutoTokenizer
 
 from alloylm.engine.spmd import SPMDActor, SPMDActorConfig, init_dist
 from alloylm.impl.engines.qwen import Qwen3ChatTemplate
+from alloylm.impl.engines.qwen.flash_attn import flash_attn_varlen_fwd
 from alloylm.impl.engines.qwen.qwen2_modeling2 import (
     FSDPConfig,
     FSDPQwen2ForCausalLM,
@@ -275,6 +276,38 @@ class TestQwenModel(CudaAsyncTestCase):
         model_str = str(model)
         get_logger().info(model_str)
         self.assertTrue("window size=4096" in model_str)
+
+
+class TestKernel(CudaAsyncTestCase):
+    def test_flash_attention_window_size_4096(self):
+        window_size = 4096
+        sequence_length = window_size + 1
+        head_dim = 64
+
+        query = torch.zeros(sequence_length, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+        key = torch.zeros_like(query)
+        value = torch.zeros_like(query)
+        value[0] = window_size / 2
+        cu_seq_lens = torch.tensor([0, sequence_length], device="cuda", dtype=torch.int32)
+
+        output, _ = flash_attn_varlen_fwd(
+            query,
+            key,
+            value,
+            cu_seq_lens,
+            cu_seq_lens,
+            sequence_length,
+            sequence_length,
+            head_dim**-0.5,
+            True,
+            window_size - 1,
+            window_size - 1,
+        )
+
+        # Position 4095 attends positions 0..4095 (4096 tokens), while
+        # position 4096 attends positions 1..4096 and must exclude position 0.
+        torch.testing.assert_close(output[-2].float(), torch.full_like(output[-2].float(), 0.5))
+        torch.testing.assert_close(output[-1].float(), torch.zeros_like(output[-1].float()))
 
 
 class TestQwen3ChatTemplate(unittest.TestCase):
