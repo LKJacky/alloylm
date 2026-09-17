@@ -9,6 +9,7 @@ from pydantic import BaseModel as PydanticBaseModel
 from torch import distributed as dist
 
 from alloylm.utils import get_free_port, init_ray
+from alloylm.utils import get_logger
 
 
 async def run_by_func_name(self, method, args, kwargs):
@@ -148,15 +149,19 @@ class SPMDActor:
             self.use_ray = False
 
     async def _call(self, method, *args, **kwargs):
-        if self.use_ray:
-            futures = [w.run_by_func_name.remote(method, args, kwargs) for w in self._workers]
-            return await asyncio.gather(*futures)
-        else:
-            functions = [getattr(w, method) for w in self._workers]
-            if inspect.iscoroutinefunction(functions[0]):
-                return await asyncio.gather(*[f(*args, **kwargs) for f in functions])
+        try:
+            if self.use_ray:
+                futures = [w.run_by_func_name.remote(method, args, kwargs) for w in self._workers]
+                return await asyncio.gather(*futures)
             else:
-                return [f(*args, **kwargs) for f in functions]
+                functions = [getattr(w, method) for w in self._workers]
+                if inspect.iscoroutinefunction(functions[0]):
+                    return await asyncio.gather(*[f(*args, **kwargs) for f in functions])
+                else:
+                    return [f(*args, **kwargs) for f in functions]
+        except BaseException as e:
+            get_logger().error(f"Error during SPMD call to method {method}: {e}")
+            raise
 
     def __getattr__(self, name):
         async def remote(*args, **kwargs):
