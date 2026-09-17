@@ -1195,10 +1195,9 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
 
 class FSDPQwen2ForCausalLMConfig(AlloyLMModelConfig):
     window_size: int = -1
+    model_cls: object = FSDPQwen2ForCausalLM
 
     def build(self) -> "AlloyLMModel":
         assert self.path, "Model path must be specified in the configuration."
         assert self.model_cls is FSDPQwen2ForCausalLM, "Model class must be FSDPQwen2ForCausalLM"
-        return self.FSDPQwen2ForCausalLM.from_pretrained(
-            self.path, fsdp_config=self.fsdp_config, window_size=self.window_size
-        )
+        return self.model_cls.from_pretrained(self.path, fsdp_config=self.fsdp_config, window_size=self.window_size)
