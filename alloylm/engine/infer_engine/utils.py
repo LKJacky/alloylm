@@ -29,6 +29,9 @@ class GeneConfig:
         self.release_at_once = release_at_once
         self.enable_thinking = enable_thinking
 
+    def __repr__(self):
+        return f"GeneConfig(temperature={self.temperature}, top_k={self.top_k}, top_p={self.top_p}, stop_token={self.stop_token}, total_max_length={self.total_max_length}, max_entropy={self.max_entropy}, release_at_once={self.release_at_once}, enable_thinking={self.enable_thinking})"
+
 
 class GatherContext:
     def __init__(self, model):

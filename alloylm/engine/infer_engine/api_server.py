@@ -417,9 +417,7 @@ class APIServer:
                 enable_thinking=self.thinking_pattern is not None
                 and request.chat_template_kwargs.get("thinking", False),
             )
-            self.logger.info(
-                f"Get a request, temp: {gene_config.temperature}, top_p: {gene_config.top_p}, top_k: {gene_config.top_k}, thinking: {gene_config.enable_thinking}, training: {request.for_training}, interactive: {release_at_once is False}"
-            )
+            self.logger.info(f"Get a request, {gene_config}")
 
             session: SessionItem = self.get_session(request.session_id)
             # get input text
@@ -490,7 +488,9 @@ class APIServer:
                 await self.release_session(
                     session.session_id, release_cache=False, save_infer_info=request.for_training
                 )  # cache had been released
-
+            self.logger.info(
+                f"Finish {session.session_id}  Release at once: {release_at_once}, history tokens: {result['usage']['history_tokens']}, input tokens: {result['usage']['input_tokens']} output tokens: {result['usage']['output_tokens']}"
+            )
             return {
                 "id": str(session.session_id),
                 "object": "chat.completion",
