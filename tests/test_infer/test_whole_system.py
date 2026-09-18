@@ -2,9 +2,9 @@ import asyncio
 import os
 import random
 import unittest
+import uuid
 
 from alloylm.server.client import HighConcurrentClient as AsyncClient
-from alloylm.server.client import enable_interactive_session
 from alloylm.test_utils import CudaAsyncTestCase, LaunchTestServer
 from alloylm.utils import get_logger
 
@@ -32,16 +32,17 @@ class TestLaunchSystem(CudaAsyncTestCase):
             ],
         ]
         client = AsyncClient(api_key="EMPTY", base_url=f"http://localhost:{port}/v1")
-        client = enable_interactive_session(client)
+
         prompt = random.choice(all_prompts)
         messages = []
+        uuid_val = uuid.uuid4().int
         for p, answer in prompt:
             messages.append(p)
             output = await client.chat.completions.create(
                 model="ALLOYLM",
                 messages=messages,
                 max_completion_tokens=4096,
-                extra_body={"top_k": 1},
+                extra_body={"top_k": 1, "sesion_id": uuid_val},
             )
             output_str = output.choices[0].message.content
             messages.append({"role": "assistant", "content": output_str})
@@ -51,6 +52,7 @@ class TestLaunchSystem(CudaAsyncTestCase):
                 msg=f"Interactive Test failed: Prompt: {p['content']}, Expected '{answer}', got '{output_str}'",
             )
 
+        await client.chat.completions.create(messages=[], extra_body={"sesion_id": uuid_val})  # release session
         await client.close()
 
     async def try_forward_complete(self, port=8000):

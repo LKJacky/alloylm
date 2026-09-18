@@ -3,7 +3,6 @@ import copy
 import os
 import traceback
 import uuid
-from functools import partial
 from typing import Any, Optional
 
 import aiohttp
@@ -11,32 +10,6 @@ import httpx
 from openai import NOT_GIVEN, AsyncClient, NotGiven
 from openai.types.chat.chat_completion import ChatCompletion
 from pydantic import BaseModel, Field
-
-
-def enable_interactive_session(client: AsyncClient):
-    """Give a client an isolated server-side session and release it on
-    close."""
-    session_id = uuid.uuid4().int
-    create = client.chat.completions.create
-    if isinstance(create, partial):
-        keywords = copy.deepcopy(create.keywords)
-        extra_body = dict(keywords.get("extra_body") or {})
-        extra_body["session_id"] = session_id
-        keywords["extra_body"] = extra_body
-        client.chat.completions.create = partial(create.func, *create.args, **keywords)
-    else:
-        client.chat.completions.create = partial(create, extra_body={"session_id": session_id})
-
-    original_close = client.close
-
-    async def close_with_session_id():
-        try:
-            await client.chat.completions.create(messages=[], model="")
-        finally:
-            await original_close()
-
-    client.close = close_with_session_id
-    return client
 
 
 class SharedSession:
@@ -86,10 +59,10 @@ async def cancel_and_wait(future: asyncio.Future, raise_cancelled=False):
         await future
     except asyncio.CancelledError as e:
         if raise_cancelled:
-            raise e
+            raise e  # noqa
     except Exception as e:
         traceback.print_exc()
-        raise e
+        raise e  # noqa
 
 
 class GenerateReqInput(BaseModel):
@@ -145,7 +118,7 @@ class HighConcurrentClient(AsyncClient):
                     kwargs.pop(key)
 
             if "timeout" not in kwargs or kwargs["timeout"] is NotGiven:
-                kwargs["timeout"] = int(os.environ.get("ALLOYLM_TIMEOUT", 3600))
+                kwargs["timeout"] = int(os.environ.get("ALLOYLM_TIMEOUT", str(3600)))
             timeout = kwargs["timeout"]
 
             async with (await self.get_session()).post(
@@ -159,10 +132,10 @@ class HighConcurrentClient(AsyncClient):
                 output.choices[0].finish_reason = finish_reason
                 return output
         except asyncio.CancelledError as e:
-            raise e
+            raise e  # noqa
         except Exception as e:
             traceback.print_exc()
-            raise e
+            raise e  # noqa
 
     async def chat_interactive_v1(
         self,
@@ -307,7 +280,7 @@ class HighConcurrentClient(AsyncClient):
     async def end_session(self, session_id):
         async with (await self.get_session()).post(
             self._base_url + "/chat/interactive",
-            json=dict(prompt="", session_id=session_id, request_output_len=0, interactive_mode=False),
+            json={"prompt": "", "session_id": session_id, "request_output_len": 0, "interactive_mode": False},
             timeout=7200,
         ) as response:
             assert response.status == 200, (
@@ -332,7 +305,7 @@ class HighConcurrentClientInteractive(HighConcurrentClient):
         try:
             async with (await self.get_session()).get(self._base_url + "/chat/interactive", timeout=10) as response:
                 return response.status != 404
-        except Exception:
+        except Exception:  # noqa
             return False
 
     async def _create_completion(self, **kwargs):
@@ -419,7 +392,7 @@ class HighConcurrentClient(AsyncClient):
                     kwargs.pop(key)
 
             if "timeout" not in kwargs or kwargs["timeout"] is NotGiven:
-                kwargs["timeout"] = int(os.environ.get("ALLOYLM_TIMEOUT", 3600))
+                kwargs["timeout"] = int(os.environ.get("ALLOYLM_TIMEOUT", str(3600)))
             timeout = kwargs["timeout"]
             async with (await self.get_session()).post(
                 self._base_url + "/chat/completions", json=kwargs, timeout=timeout
@@ -432,10 +405,10 @@ class HighConcurrentClient(AsyncClient):
                 output.choices[0].finish_reason = finish_reason
                 return output
         except asyncio.CancelledError as e:
-            raise e
+            raise e  # noqa
         except Exception as e:
             traceback.print_exc()
-            raise e
+            raise e  # noqa
 
     async def chat_interactive_v1(
         self,
@@ -580,7 +553,7 @@ class HighConcurrentClient(AsyncClient):
     async def end_session(self, session_id):
         async with (await self.get_session()).post(
             self._base_url + "/chat/interactive",
-            json=dict(prompt="", session_id=session_id, request_output_len=0, interactive_mode=False),
+            json={"prompt": "", "session_id": session_id, "request_output_len": 0, "interactive_mode": False},
             timeout=7200,
         ) as response:
             assert response.status == 200, (
