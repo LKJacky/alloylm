@@ -1,4 +1,5 @@
 import os
+import uuid
 from functools import partial
 
 import numpy as np
@@ -10,6 +11,7 @@ class InferArgs(BaseModel):
     model_url: str = "http://127.0.0.1:8000/v1"
     model_name: str = "ALLOYLM"
     api_key: str = os.environ.get("OPENAI_API_KEY", "EMPTY")
+    interactive_mode: bool = False
 
     sample_args: dict = {
         "temperature": 1.0,
@@ -36,9 +38,21 @@ class InferArgs(BaseModel):
             base_url=self.model_url,
             api_key=self.api_key,
         )
-        client.chat.completions.create = partial(
-            client.chat.completions.create, model=self.model_name, **self.sample_args
-        )
+        sample_args = {**self.sample_args}
+        if self.interactive_mode:
+            sample_args["extra_body"] = {**sample_args.get("extra_body", {}), "session_id": uuid.uuid4().int}
+        client.chat.completions.create = partial(client.chat.completions.create, model=self.model_name, **sample_args)
+        if self.interactive_mode:
+            original_close = client.close
+
+            async def close_with_session_id():
+                try:
+                    await client.chat.completions.create(messages=[], model="")  # end session
+                finally:
+                    await original_close()
+
+            client.close = close_with_session_id
+
         return client
 
 

@@ -3,7 +3,8 @@
 import json
 from collections.abc import Mapping
 
-QWEN_TOOL_PATTERN = r"<tool_call>\s*(.*?)\s*</tool_call>"
+QWEN_TOOL_PATTERN = r"<tool_call>(.*?)</tool_call>"
+QWEN_THINKING_PATTERN = r"\A(.*?)</think>"
 
 
 def _get(value, key, default=None):
@@ -18,6 +19,7 @@ def json2str(value):
 
 class Qwen3ChatTemplate:
     # this is a modified qwen3 chat template. The main difference is that the template do not drop past reasoning content, and it will keep all the reasoning content in the final output.
+    # remove \n in think template
     @classmethod
     def render(
         cls,
@@ -88,9 +90,9 @@ class Qwen3ChatTemplate:
                 #     output.append(f"<|im_start|>assistant\n{content}")
 
                 if reasoning_content:
-                    output.append(f"<|im_start|>assistant\n<think>\n\n{reasoning_content}</think>{content}")
+                    output.append(f"<|im_start|>assistant\n<think>\n{reasoning_content}</think>{content}")
                 else:
-                    output.append(f"<|im_start|>assistant\n<think>\n\n</think>\n\n{content}")
+                    output.append(f"<|im_start|>assistant\n<think>\n</think>{content}")
 
                 ###############################################################################
 
@@ -120,10 +122,10 @@ class Qwen3ChatTemplate:
         if add_generation_prompt:
             output.append("<|im_start|>assistant\n")
             if enable_thinking is False:
-                output.append("<think>\n\n</think>\n\n")
+                output.append("<think>\n</think>")
             # + ###########################################################
             else:
-                output.append("<think>\n\n")
+                output.append("<think>\n")
             ###############################################################
 
         return "".join(output)

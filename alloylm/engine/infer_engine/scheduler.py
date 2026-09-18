@@ -445,7 +445,7 @@ class SchedulerServer:
 
             except Exception as e:
                 self.logger.error(f"Scheduler server encountered an error: {e}")
-                print("Full traceback:", traceback.format_exc())
+                self.logger.error(f"Full traceback: {traceback.format_exc()}")
                 raise
 
     async def launch(self):

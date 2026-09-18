@@ -51,7 +51,9 @@ class BaseAgent:
 
     async def solve(self, messages=()):
         self.messages.extend(messages)
-        for _ in range(self.max_steps):
+        i = 0
+        while i < self.max_steps:
+            i += 1
             message = await self.chat(self.messages)
             # build message from assistant
             message_data = {"role": message.role, "content": message.content}
@@ -67,6 +69,8 @@ class BaseAgent:
                 for call in message.tool_calls:
                     response = await self.execute(call)
                     self.messages.append({"role": "tool", "tool_call_id": call.id, "content": response})
+        if i == self.max_steps:
+            self.finish_reason = "step"
         return self.messages
 
     async def close(self):

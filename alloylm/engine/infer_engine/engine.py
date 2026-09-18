@@ -30,6 +30,7 @@ class InferEngineConfig(PydanticBaseModel):
     proxy_url: str | None = None
 
     tool_pattern: str | None = None
+    thinking_pattern: str | None = None
 
 
 class InferEngine:
@@ -95,6 +96,7 @@ class InferEngine:
             proxy_url=proxy_url,
             model_name=engine_config.model_name,
             tool_pattern=engine_config.tool_pattern,
+            thinking_pattern=engine_config.thinking_pattern,
         )
 
         self.gather_context = GatherContext(model)
@@ -141,8 +143,8 @@ class InferEngine:
         await self.api_server.wait_closed()
 
     def fetch_infer_info(self):
-        cached_infer_info = self.api_server.cached_infer_info.copy()
-        self.api_server.cached_infer_info.clear()
+        cached_infer_info = self.api_server.cached_infer_info.bank.copy()
+        self.api_server.cached_infer_info.bank.clear()
         return cached_infer_info
 
 

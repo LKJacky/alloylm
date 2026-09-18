@@ -3,6 +3,7 @@ import asyncio
 import importlib
 
 from alloylm.algorithm.eval.base import EvalConfig, run_eval
+from alloylm.utils import get_logger
 
 
 async def main():
@@ -28,7 +29,7 @@ async def main():
     if args.concurrency is not None:
         config.concurrency = args.concurrency
 
-    print(f"Loaded config: {config}")
+    get_logger().info(f"Loaded config: {config}")
 
     await run_eval(config)
     return 0

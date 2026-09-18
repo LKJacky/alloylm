@@ -5,7 +5,6 @@ from openai import AsyncClient
 from alloylm.algorithm.base import Dataset, DatasetConfig, Task, TaskData, TaskItem
 from alloylm.impl.agent.agent import BaseAgent
 from alloylm.impl.agent.env import BaseEnv
-from alloylm.server.client import enable_interactive_session
 
 
 class CountToNEnv(BaseEnv):
@@ -77,7 +76,6 @@ class CountToNTask(Task):
         env = CountToNEnv(target)
         client = task_data.infer_args.get_client(client_type=AsyncClient)
         agent = BaseAgent(client, env=env, max_steps=target * 2)
-        client = enable_interactive_session(client)
         try:
             task_data.messages = await agent.solve(messages=task_data.messages)
 
@@ -92,6 +90,7 @@ class CountToNTask(Task):
                 f"Inference timeout {task_data.infer_args.sample_args.get('timeout', 'unknow')} seconds"
             ) from e
         finally:
+            await agent.close()
             await client.close()
         return task_data
 

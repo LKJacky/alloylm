@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import logging
 import os
 import uuid
 from collections.abc import Callable
@@ -54,7 +55,8 @@ class TrainInferEngine:
                 engine_config.train_config.work_dir,
                 f"{engine_logger_name()}.log",
             ),
-            output_to_stdout=False,
+            output_to_stdout=True,
+            log_level=logging.WARNING,
             force_recreate=True,
         )
         self.model = model_config.build()
@@ -117,7 +119,9 @@ class TrainInferEngine:
 
     def step(self, batch, step):
         for i, item in enumerate(batch):
-            infer_info = ray.get(item.pop("infer_info"))
+            infer_info = item.pop("infer_info")
+            if isinstance(infer_info, ray.ObjectRef):
+                infer_info = ray.get(infer_info)
             batch[i] = {**item, **infer_info, "num_tokens": len(infer_info["input_ids"])}
         if dist.get_rank() == 0 and step == 0 and batch:
             input_text = self.tokenizer.decode(batch[0]["input_ids"], skip_special_tokens=False)
@@ -233,8 +237,9 @@ class SpmdTrainInferEngine:
         infer_tokens = await self.actor.pause_server()  # rank 3
         infer_tokens = [sum(rank_tokens[i] for rank_tokens in infer_tokens) for i in range(len(infer_tokens[0]))]
         infer_infos = await self.actor.fetch_infer_info()
-        for infer_info in infer_infos:
-            self.infer_bank.update(infer_info)
+        for infer_info_dict in infer_infos:
+            for key, value in infer_info_dict.items():
+                self.infer_bank.add_raw(key, value)
         return infer_tokens
 
     async def stop_serve(self):
