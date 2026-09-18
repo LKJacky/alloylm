@@ -37,6 +37,7 @@ class InferArgs(BaseModel):
         client = client_type(
             base_url=self.model_url,
             api_key=self.api_key,
+            max_retries=0,  # it's important to avoid client re-sent request cause session management issues
         )
         sample_args = {**self.sample_args}
         if self.interactive_mode:

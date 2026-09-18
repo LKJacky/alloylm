@@ -44,7 +44,7 @@ class InferItem(TaskItem):
     def should_stop(self):
         if len(self.device_session.tokens) > 0 and self.device_session.tokens[-1] in self.gene_config.stop_token:
             return "stop"
-        elif (self.device_session.total_num_tokens() - self.num_init_tokens) >= self.gene_config.total_max_length:
+        elif self.device_session.total_num_tokens() >= self.gene_config.total_max_length:
             return "length"
         elif self.device_session.entropy[-1] >= self.gene_config.max_entropy:
             return "entropy"
@@ -199,6 +199,32 @@ class SchedulerServer:
 
     # schedule
 
+    def reset_session(self, session_id: int):
+        device_sessions = []
+        idle_session = self.device_sessions.pop(session_id, None)
+        if idle_session is not None:
+            device_sessions.append(idle_session)
+
+        infer_items = [item for item in self.prefill_queue if item.session_id == session_id]
+        for item in infer_items:
+            self.prefill_queue.remove(item)
+
+        decode_items = [item for item in self.decode_queue if item.session_id == session_id]
+        if decode_items:
+            self.decode_queue[:] = [item for item in self.decode_queue if item.session_id != session_id]
+        infer_items.extend(decode_items)
+
+        for item in infer_items:
+            result = item.get_finish_result()
+            result["finish_reason"] = "abort"
+            item._result = {"item": result, "reason": "abort"}
+            item.finished_event.set()
+            device_sessions.append(item.device_session)
+
+        unique_sessions = list({id(session): session for session in device_sessions}.values())
+        if unique_sessions:
+            self.cache.reset(unique_sessions)
+
     @torch.inference_mode()
     async def update_queue(self):
         while (len(self.prefill_queue) + len(self.decode_queue) == 0) or (not self.wait_queue.empty()):
@@ -226,9 +252,7 @@ class SchedulerServer:
                             f"Request: temperature: {session.gene_config.temperature}, top_k: {session.gene_config.top_k}, top_p: {session.gene_config.top_p}, entropy: {session.gene_config.max_entropy}"
                         )
             elif isinstance(session, ResetItem):
-                exist_session = self.device_sessions.pop(session.session_id, None)
-                if exist_session is not None:
-                    self.cache.reset([exist_session])
+                self.reset_session(session.session_id)
                 await self.finish_item(session, None)
             elif isinstance(session, ReleaseItem):
                 return True
