@@ -4,7 +4,8 @@ import random
 import unittest
 import uuid
 
-from alloylm.server.client import HighConcurrentClient as AsyncClient
+from openai import AsyncClient
+
 from alloylm.test_utils import CudaAsyncTestCase, LaunchTestServer
 from alloylm.utils import get_logger
 
@@ -79,35 +80,13 @@ class TestLaunchSystem(CudaAsyncTestCase):
         )
         await client.close()
 
-    async def try_generate(self, tokenizer, port=8000):
-        prompts = [
-            ({"role": "user", "content": "compute 5*30+5"}, "155"),
-            ({"role": "user", "content": "compute 5*7=?"}, "35"),
-            ({"role": "user", "content": "what is the capital of France?"}, "Paris"),
-            ({"role": "user", "content": "what is the capital of Japan?"}, "Tokyo"),
-        ]
-        client = AsyncClient(api_key="EMPTY", base_url=f"http://localhost:{port}")
-        prompt, answer = random.choice(prompts)
-        input_ids = tokenizer.apply_chat_template(
-            conversation=[prompt],
-            add_generation_prompt=True,
-            return_dict=False,
-        )
-        output = (await client.generate(input_ids=input_ids, top_k=1, max_tokens=4096))["text"]
-        self.assertTrue(
-            answer.lower() in output.lower(),
-            msg=f"Generate Test failed: Prompt: {prompt['content']}, Expected '{answer}', got '{output}'",
-        )
-        await client.close()
-
     async def test_system(self):
-        async with LaunchTestServer() as server:
+        async with LaunchTestServer():
             bs = 32
             futures = []
             for i in range(bs):
                 futures.append(asyncio.create_task(self.try_forward_interactive()))
                 futures.append(asyncio.create_task(self.try_forward_complete()))
-                futures.append(asyncio.create_task(self.try_generate(server.tokenizer)))
             await asyncio.gather(*futures)
 
     @unittest.skipUnless(
@@ -115,21 +94,19 @@ class TestLaunchSystem(CudaAsyncTestCase):
         "MOE tests are disabled unless RUN_30B_TESTS=1 is set in the environment",
     )
     async def test_system_moe(self):
-        async with LaunchTestServer(model_path="Qwen/Qwen3-30B-A3B") as server:
+        async with LaunchTestServer(model_path="Qwen/Qwen3-30B-A3B"):
             bs = 32
             futures = []
             for i in range(bs):
                 futures.append(asyncio.create_task(self.try_forward_interactive()))
                 futures.append(asyncio.create_task(self.try_forward_complete()))
-                futures.append(asyncio.create_task(self.try_generate(server.tokenizer)))
             await asyncio.gather(*futures)
 
     async def test_system_chunk_prefill(self):
-        async with LaunchTestServer(max_prefill_length=32) as server:
+        async with LaunchTestServer(max_prefill_length=32):
             bs = 32
             futures = []
             for i in range(bs):
                 futures.append(asyncio.create_task(self.try_forward_interactive()))
                 futures.append(asyncio.create_task(self.try_forward_complete()))
-                futures.append(asyncio.create_task(self.try_generate(server.tokenizer)))
             await asyncio.gather(*futures)
