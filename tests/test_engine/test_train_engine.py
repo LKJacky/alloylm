@@ -148,11 +148,13 @@ class TrainInferEngineTest(CudaAsyncTestCase):
                 client = None
                 await engine.pause_serve()
 
-                result = await engine.train_wrapper(train_batch, step)
+                batch_info, num_optimization = await engine.set_rl_data(train_batch, step)
+                for _ in range(num_optimization):
+                    await engine.step_rl()
 
                 completion_tokens = sum(response.usage.completion_tokens for response in responses)
-                self.assertEqual(result["logprob_diff/num_tokens"], completion_tokens)
-                self.assertTrue(math.isfinite(result["logprob_diff/avg_diff"]))
+                self.assertEqual(batch_info["logprob_diff/num_tokens"], completion_tokens)
+                self.assertTrue(math.isfinite(batch_info["logprob_diff/avg_diff"]))
         finally:
             if client is not None:
                 await client.close()

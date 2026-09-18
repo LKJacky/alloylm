@@ -114,23 +114,27 @@ class TrainInferEngine:
 
     # train
 
-    def step(self, batch, step):
+    def set_rl_data(self, batch, step):
         for i, item in enumerate(batch):
             infer_info = item.pop("infer_info")
             if isinstance(infer_info, ray.ObjectRef):
                 infer_info = ray.get(infer_info)
             batch[i] = {**item, **infer_info, "num_tokens": len(infer_info["input_ids"])}
+
         if dist.get_rank() == 0 and step == 0 and batch:
-            input_text = self.tokenizer.decode(batch[0]["input_ids"], skip_special_tokens=False)
+            input_text = self.tokenizer.decode(batch[-1]["input_ids"], skip_special_tokens=False)
             labels_text = self.tokenizer.decode(
-                [token_id for token_id in batch[0]["labels"] if token_id != -100],
+                [token_id for token_id in batch[-1]["labels"] if token_id != -100],
                 skip_special_tokens=False,
             )
             with open(os.path.join(self.args.work_dir, "train_sample.txt"), "w", encoding="utf-8") as f:
                 f.write(f"Input Text:\n{input_text}\n\n")
                 f.write(f"Labels Text:\n{labels_text}\n")
 
-        return self.train_engine.step(batch, step)
+        return self.train_engine.set_rl_data(batch, step)
+
+    def step_rl(self):
+        return self.train_engine.step_rl()
 
     # checkpoint
 
@@ -184,7 +188,7 @@ class SpmdTrainInferEngine:
     async def lazy_init(self):
         await self.actor.lazy_init()
 
-    async def train_wrapper(self, batch: list[RLInput], step):
+    async def set_rl_data(self, batch: list[RLInput], step):
         train_data = []
         for rl_data in batch:
             infer_info = self.infer_bank.retrieve_infer_info(rl_data["messages"])
@@ -198,11 +202,11 @@ class SpmdTrainInferEngine:
                 )
             else:
                 get_logger().warning(f"Skipping training data due to missing inference information: {rl_data}")
-        batch = train_data
-        return await self.train(batch, step)
+        results = await self.actor.set_rl_data(train_data, step)
+        return results[0]
 
-    async def train(self, batch: list[RLInput], step):
-        results = await self.actor.step(batch, step)
+    async def step_rl(self):
+        results = await self.actor.step_rl()
         return results[0]
 
     async def serve(self):
@@ -248,6 +252,6 @@ class SpmdTrainInferEngine:
 
     async def step_sft(self, num_micro_steps: int) -> dict[str, float]:
         # The SPMD actor returns one result per worker rank; return rank 0's,
-        # mirroring self.train() above (all ranks share the globally-reduced loss).
+        # mirroring step_rl() above (all ranks share the globally-reduced loss).
         results = await self.actor.step_sft(num_micro_steps)
         return results[0]

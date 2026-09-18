@@ -47,9 +47,11 @@ def print_plain(files: list[str]) -> None:
                 if call_id is not None:
                     header += f" (call {call_id})"
                 print(header)
-                print(msg.get("content", ""))
                 reasoning = msg.get("reasoning_content")
-                if reasoning:
+                if msg.get("role") == "assistant" and reasoning:
+                    print(f"  reasoning:\n{reasoning}")
+                print(msg.get("content") or "")
+                if msg.get("role") != "assistant" and reasoning:
                     print(f"  reasoning:\n{reasoning}")
                 for call in msg.get("tool_calls") or []:
                     fn = call.get("function") or call
@@ -86,7 +88,8 @@ tbody tr.sel{background:#1d2a3a}
 .metric{font-weight:700}.ok{color:var(--ok)}.bad{color:var(--bad)}.none{color:var(--dim)}
 .meta{color:var(--dim);margin-bottom:14px}
 .meta b{color:var(--fg)}
-.msg{margin:10px 0 18px;border-left:2px solid var(--border);padding-left:12px}
+.msg{max-width:95%;margin:10px 0 18px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--panel)}
+.msg.system{border-color:#31577c;background:#14202d}.msg.user{border-color:#315f3d;background:#15241a}.msg.assistant{border-color:#66582e;background:#242116}.msg.tool{border-color:#593f70;background:#21192a}
 .role{font-weight:700}
 .role.system{color:#6db5ff}.role.user{color:#59c96e}.role.assistant{color:var(--tool)}.role.tool{color:#c78bff}
 .callid{color:var(--dim);font-weight:400}
@@ -106,7 +109,7 @@ button.showall{background:none;border:none;color:var(--accent);cursor:pointer;fo
   <span id="matchinfo"></span>
 </header>
 <main>
-  <div id="list"><table><thead><tr><th>#</th><th>metric</th><th>finish</th><th>tokens</th><th>id</th></tr></thead><tbody id="rows"></tbody></table></div>
+  <div id="list"><table><thead><tr><th>#</th><th>metric</th><th>finish</th><th>tokens</th><th>steps</th><th>id</th></tr></thead><tbody id="rows"></tbody></table></div>
   <div id="detail"><div class="meta">Select a record.</div></div>
 </main>
 <div id="footer">j/k or &#8593;/&#8595; move &middot; Enter open &middot; g/G top/bottom &middot; / focus search &middot; n/N matches &middot; click row to inspect</div>
@@ -159,7 +162,7 @@ function metricCell(m) {
 
 function renderList() {
   rowsEl.innerHTML = records.map((r) =>
-    `<tr data-i="${r.idx}" class="${r.idx === cursor ? 'sel' : ''}"><td>${r.idx}</td>${metricCell(r.metric)}<td>${esc(r.finish_reason)}</td><td>${r.input_tokens ?? '-'}/${r.output_tokens ?? '-'}</td><td>${esc(r.id)}</td></tr>`
+    `<tr data-i="${r.idx}" class="${r.idx === cursor ? 'sel' : ''}"><td>${r.idx}</td>${metricCell(r.metric)}<td>${esc(r.finish_reason)}</td><td>${r.input_tokens ?? '-'}/${r.output_tokens ?? '-'}</td><td>${r.num_steps}</td><td>${esc(r.id)}</td></tr>`
   ).join('');
   const sel = rowsEl.querySelector('tr.sel');
   if (sel) sel.scrollIntoView({ block: 'nearest' });
@@ -195,16 +198,20 @@ function renderDetail(rec) {
 
 function msgHtml(m) {
   const role = m.role || '?';
-  let head = `<div class="role ${role}">### ${esc(role)}` +
+  const roleClass = ['system', 'user', 'assistant', 'tool'].includes(role) ? role : '';
+  let head = `<div class="role ${roleClass}">### ${esc(role)}` +
     (m.tool_call_id ? ` <span class="callid">(call ${esc(m.tool_call_id)})</span>` : '') + '</div>';
-  const parts = [];
-  if (m.content) parts.push(`<pre>${escTrunc(m.content)}</pre>`);
-  if (m.reasoning_content) parts.push(`<div class="reasoning"><div class="rlbl">reasoning</div><pre>${escTrunc(m.reasoning_content)}</pre></div>`);
-  for (const c of (m.tool_calls || [])) {
+  const reasoning = m.reasoning_content
+    ? `<div class="reasoning"><div class="rlbl">reasoning</div><pre>${escTrunc(m.reasoning_content)}</pre></div>`
+    : '';
+  const content = m.content ? `<pre>${escTrunc(m.content)}</pre>` : '';
+  const tools = (m.tool_calls || []).map((c) => {
     const f = c.function || c;
-    parts.push(`<pre class="toolcall">- ${esc(f.name || '?')} ${esc(String(f.arguments || ''))}</pre>`);
-  }
-  return `<div class="msg">${head}${parts.join('')}</div>`;
+    const args = typeof f.arguments === 'string' ? f.arguments : JSON.stringify(f.arguments || '');
+    return `<pre class="toolcall">- ${esc(f.name || '?')} ${esc(args)}</pre>`;
+  }).join('');
+  const body = role === 'assistant' ? reasoning + content + tools : content + reasoning + tools;
+  return `<div class="msg ${roleClass}">${head}${body}</div>`;
 }
 
 tabsEl.addEventListener('click', (e) => {
@@ -302,6 +309,7 @@ def run_web(files: list[str], host: str, port: int) -> None:
                 "finish_reason": str(rec.get("finish_reason") or "-"),
                 "input_tokens": rec.get("input_tokens"),
                 "output_tokens": rec.get("output_tokens"),
+                "num_steps": sum(msg.get("role") == "assistant" for msg in rec.get("messages") or []),
             }
             for i, rec in enumerate(records[file_idx])
         ]
