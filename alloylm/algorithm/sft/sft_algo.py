@@ -1,7 +1,10 @@
 import json
+import math
 import os
 import random
 import shutil
+import time
+from datetime import timedelta
 from typing import Any
 
 import aiofiles
@@ -90,8 +93,6 @@ class SFTTrainer:
         # the engine's SFTDataset (workers), so num_tokens agree on both sides.
         self.tokenizer = config.tokenizer
         self.chat_template = config.chat_template
-        self.dp_size = config.llm_config.fsdp_config.train_mesh["mesh_shape"][0]
-        self.sp_size = config.engine_config.train_config.sp_size
 
         # Populated by lazy_init / advanced by fit.
         self.jsonl_paths: list[str] = []
@@ -152,14 +153,15 @@ class SFTTrainer:
         self.steps_per_epoch = len(self.packs) // self.config.global_batch_size
 
         assert self.steps_per_epoch >= 1, (
-            f"Not enough packs for a single optimizer step: {len(self.packs)} packs across dp_size={self.dp_size} "
+            f"Not enough packs for a single optimizer step: {len(self.packs)} packs"
             f"Add more data or lower global_batch_size={self.config.global_batch_size}."
         )
 
-        total_tokens = sum(sum(p.num_tokens) for p in self.packs)
+        total_tokens = sum(sum(p.num_tokens) for p in self.packs) / 10**9
+        max_sample_length = max([x for p in self.packs for x in p.num_tokens])
         self.logger.info(
-            f"SFT data ready: {len(self.packs)} packs, {total_tokens} tokens, {len(self.jsonl_paths)} files, {num_skip} skipped samples, "
-            f"dp_size={self.dp_size}, {self.steps_per_epoch} steps/epoch (global_batch_size={self.config.global_batch_size})."
+            f"SFT data ready: {len(self.packs)} packs, {total_tokens:.2f}B tokens, max_length={math.ceil(max_sample_length / 1024)}, {len(self.jsonl_paths)} files, {num_skip} skipped samples, "
+            f"{self.steps_per_epoch} steps/epoch (global_batch_size={self.config.global_batch_size})."
         )
         if self.config.total_training_steps == -1:
             self.config.total_training_steps = self.steps_per_epoch
@@ -175,7 +177,9 @@ class SFTTrainer:
 
     async def fit(self):
         epoch = -1
-        for step in range(self.cur_step, self.config.total_training_steps):
+        t0 = time.time()
+        start_step = self.cur_step
+        for step in range(start_step, self.config.total_training_steps):
             with MeasureTime("step_time") as timer:
                 self.cur_step = step
 
@@ -207,11 +211,17 @@ class SFTTrainer:
             # total_tokens is reduced across all ranks and therefore duplicated
             # across sequence-parallel ranks. Report throughput per GPU.
             train_time = timer.summary()["step_time.train_time"]
-            global_tokens = train_log["num_tokens"] / self.sp_size
-            train_log["tgs"] = int(global_tokens / train_time / self.dp_size / self.sp_size)
+            train_log["tgs"] = int(
+                train_log["num_tokens"] / train_time / self.config.engine_config.train_config.num_workers
+            )
+
+            elapsed_time = time.time() - t0
+            completed_steps = step - start_step + 1
+            remaining_steps = self.config.total_training_steps - step - 1
+            eta = timedelta(seconds=round(elapsed_time / completed_steps * remaining_steps))
 
             log_str = ", ".join(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in train_log.items())
-            self.logger.info(f"**SFT training step {step} logs: {log_str}")
+            self.logger.info(f"SFT {step} / {self.config.total_training_steps}: {log_str}, ETA: {eta}")
             for k, v in train_log.items():
                 self.tb_writer.add_scalar(f"sft/{k}", v, step)
             self.tb_writer.add_scalar("sft/epoch", epoch, step)

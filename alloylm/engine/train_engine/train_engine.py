@@ -1,22 +1,24 @@
 import gc
 import math
 import os
+import platform
+import random
+import sys
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import wait
 from contextlib import contextmanager
 from datetime import timedelta
+from functools import partial
 from typing import Any, TypedDict
 
+import numpy as np
 import ray
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn.functional as F
 import transformers
-from mmengine import mkdir_or_exist
-from mmengine.runner import set_random_seed
-from mmengine.utils.dl_utils import collect_env
 from pydantic import BaseModel
 from torch import distributed as dist
 from torch.distributed.checkpoint.state_dict import (
@@ -54,6 +56,26 @@ class RLInput(TypedDict, total=False):
     messages: list[dict]
     advantages: float
     infer_info: ray.ObjectRef
+
+
+def set_random_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def collect_env():
+    return OrderedDict(
+        {
+            "Platform": platform.platform(),
+            "Python": sys.version.replace("\n", " "),
+            "PyTorch": torch.__version__,
+            "CUDA available": torch.cuda.is_available(),
+            "CUDA runtime": torch.version.cuda,
+            "transformers": transformers.__version__,
+        }
+    )
 
 
 # loss
@@ -103,9 +125,13 @@ def default_loss_func(
     return pg_loss, entropy
 
 
-class ChunkPolicyLoss(torch.autograd.Function):
-    """Compute policy loss in chunks to avoid materializing full [1, seq,
-    vocab] logits."""
+def default_sft_loss_func(logits: torch.Tensor, labels: torch.Tensor, loss_weight: float):
+    return F.cross_entropy(logits.flatten(0, 1), labels.flatten(), reduction="sum") * loss_weight
+
+
+class ChunkLoss(torch.autograd.Function):
+    """Compute a loss in chunks without materializing full vocabulary
+    logits."""
 
     @staticmethod
     def chunk_forward(hidden_states, head_weight, loss_fn, loss_kwargs):
@@ -113,54 +139,40 @@ class ChunkPolicyLoss(torch.autograd.Function):
         return loss_fn(logits, **loss_kwargs)
 
     @staticmethod
-    def forward(ctx, hidden_states, head_weight, loss_fn, loss_kwargs_chunks, chunk_size):
-        device = hidden_states.device
-        accumulated_loss = torch.tensor(0.0, device=device)
+    def forward(ctx, hidden_states, head_weight, loss_fn, loss_kwargs_chunks, chunk_size, has_aux):
+        accumulated_loss = torch.tensor(0.0, device=hidden_states.device)
         grad_hidden = torch.empty_like(hidden_states)
         grad_weight = torch.zeros_like(head_weight)
 
         h_chunks = torch.split(hidden_states, chunk_size, dim=1)
         grad_chunks = torch.split(grad_hidden, chunk_size, dim=1)
+        aux_parts = []
 
-        entropy_parts = []
-        for i in range(len(h_chunks)):
-            (chunk_grad_h, chunk_grad_w), (chunk_loss, entropy) = torch.func.grad_and_value(
-                ChunkPolicyLoss.chunk_forward, argnums=(0, 1), has_aux=True
-            )(h_chunks[i], head_weight, loss_fn, loss_kwargs_chunks[i])
+        for hidden_chunk, grad_chunk, loss_kwargs in zip(h_chunks, grad_chunks, loss_kwargs_chunks):
+            grad_and_value = torch.func.grad_and_value(ChunkLoss.chunk_forward, argnums=(0, 1), has_aux=has_aux)
+            if has_aux:
+                (chunk_grad_h, chunk_grad_w), (chunk_loss, aux) = grad_and_value(
+                    hidden_chunk, head_weight, loss_fn, loss_kwargs
+                )
+                aux_parts.append(aux.detach())
+            else:
+                (chunk_grad_h, chunk_grad_w), chunk_loss = grad_and_value(
+                    hidden_chunk, head_weight, loss_fn, loss_kwargs
+                )
 
             accumulated_loss.add_(chunk_loss)
-            grad_chunks[i].copy_(chunk_grad_h)
+            grad_chunk.copy_(chunk_grad_h)
             grad_weight.add_(chunk_grad_w)
-            entropy_parts.append(entropy.detach())
 
         ctx.save_for_backward(grad_hidden, grad_weight)
-        return accumulated_loss, torch.cat(entropy_parts, dim=1)
+        if has_aux:
+            return accumulated_loss, torch.cat(aux_parts, dim=1)
+        return accumulated_loss
 
     @staticmethod
     def backward(ctx, *grad_output):
-        grad_input, grad_weight = ctx.saved_tensors
-        if torch.ne(grad_output[0], torch.tensor(1.0, device=grad_output[0].device)):
-            grad_input = grad_input * grad_output[0]
-            grad_weight = grad_weight * grad_output[0]
-        return grad_input, grad_weight, None, None, None
-
-
-def split_for_sp(shifted_labels, sequence_parallel_mesh, pad_value=-100):
-    from alloylm.engine.train_engine.utils import (
-        pad_to_multiple_of,
-        split_for_sequence_parallel,
-    )
-
-    if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
-        multiple_of = sequence_parallel_mesh.size() * 1
-    else:
-        multiple_of = 1
-
-    _labels = pad_to_multiple_of(shifted_labels, pad_value, multiple_of, 1)
-
-    if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
-        _labels = split_for_sequence_parallel(_labels, dim=1, sp_mesh=sequence_parallel_mesh)
-    return _labels
+        grad_hidden, grad_weight = ctx.saved_tensors
+        return grad_hidden * grad_output[0], grad_weight * grad_output[0], None, None, None, None
 
 
 # state
@@ -227,8 +239,8 @@ class TrainEngineConfig(BaseModel):
     step_data_process_func: object = None
 
     # INFRA
-    sp_size: int = 1
     chunk_loss_size: int = 512
+    gpu_peak_tflops: float = 100  # just a placeholder value
 
 
 class TrainEngine:
@@ -266,7 +278,6 @@ class TrainEngine:
         # print env
         if self.rank == 0:
             env = collect_env()
-            env["Transformers"] = transformers.__version__
             runtime_env = OrderedDict()
             runtime_env.update(env)
             runtime_env["Seed"] = self.config.seed
@@ -278,6 +289,7 @@ class TrainEngine:
         self.dp_mesh = self.patched_llm.fsdp_config.train_mesh["dp"]
         self.sp_mesh = self.patched_llm.fsdp_config.train_mesh["sp"]
         self.dp_size = self.dp_mesh.size()
+        self.num_workers = self.patched_llm.fsdp_config.train_mesh.size()
         self.setup_optim()
         dist.barrier()
         gc.collect()
@@ -335,7 +347,7 @@ class TrainEngine:
             pack_dataset,
             batch_size=1,
             num_workers=0,
-            collate_fn=task_collate_fn,
+            collate_fn=partial(task_collate_fn, sp_size=self.sp_mesh.size(), sp_rank=self.sp_mesh.get_local_rank()),
             persistent_workers=False,
             sampler=DistributedSampler(
                 pack_dataset,
@@ -353,6 +365,7 @@ class TrainEngine:
 
         dataloader.sampler.set_epoch(0)
         self.train_rl_step(batch, step, dataloader, batch_info)
+        batch_info["lr"] = self.optimizer.param_groups[0]["lr"]
 
         return batch_info
 
@@ -370,7 +383,7 @@ class TrainEngine:
             dataset,
             batch_size=1,
             num_workers=0,
-            collate_fn=sft_collate_fn,
+            collate_fn=partial(sft_collate_fn, sp_size=self.sp_mesh.size(), sp_rank=self.sp_mesh.get_local_rank()),
             persistent_workers=False,
             sampler=DistributedSampler(
                 dataset,
@@ -399,37 +412,54 @@ class TrainEngine:
         with torch.no_grad():
             total_tokens = torch.tensor(0.0, device="cuda")
             total_tokens_with_input = torch.tensor(0.0, device="cuda")
+            total_flops = torch.tensor(0.0, dtype=torch.float64, device="cuda")
             for packed_batch in micro_batch:
-                total_tokens += (packed_batch["labels"] != -100).sum().float().cuda()
-                total_tokens_with_input += (packed_batch["input_ids"] != -1).sum().float().cuda()
+                total_tokens += (packed_batch["shift_labels"] != -100).sum().float().cuda()
+                total_tokens_with_input += packed_batch["input_ids"].numel()
+                total_flops += self.patched_llm.compute_flops(packed_batch["seq_lens"].tolist()) / self.sp_mesh.size()
             dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
             dist.all_reduce(total_tokens_with_input, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_flops, op=dist.ReduceOp.SUM)
             total_tokens = int(total_tokens.item())
             total_tokens_with_input = int(total_tokens_with_input.item())
+            total_flops = total_flops.item()
         if total_tokens == 0:
             self.logger.warning("No supervised tokens in this step, skipping.")
-            return {"loss": 0.0, "grad_norm": 0.0, "num_tokens": 0, "tgs": 0}
+            return {"loss": 0.0, "grad_norm": 0.0, "num_tokens": 0, "tgs": 0, "mfu": 0.0}
 
+        torch.cuda.synchronize()
         step_t0 = time.time()
         step_loss = 0.0
         for packed_batch in micro_batch:
             input_ids = packed_batch["input_ids"].cuda()
-            labels = packed_batch["labels"].cuda()
+            shift_labels = packed_batch["shift_labels"].cuda()  # had been shifted
             seq_lens = packed_batch["seq_lens"].cuda()
-            position_ids = torch.cat([torch.arange(n) for n in seq_lens.tolist()], dim=0).cuda().unsqueeze_(0)
+            position_ids = packed_batch["position_ids"].cuda()
 
-            logits = self.patched_llm.train_forward(
-                TrainInput(input_ids=input_ids, position_ids=position_ids, seq_lens=seq_lens.int())
-            )  # [1, seq, vocab]
-
-            shift_logits = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
-            shift_labels = labels[:, 1:].contiguous().view(-1)
-            n_valid = (shift_labels >= 0).sum()
-            if n_valid == 0:
+            mask = shift_labels[0] >= 0
+            if not mask.any():
                 continue
-            loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
-            # normalize so the optimizer step averages over all supervised tokens
-            loss = loss * (n_valid / total_tokens * self.dp_size)
+
+            def _chunk_loss(hidden_states, _shift_labels=shift_labels, _mask=mask):
+                hidden_states = hidden_states[:, : _shift_labels.size(1)]
+                labels = _shift_labels[:, _mask]
+                return ChunkLoss.apply(
+                    hidden_states[:, _mask],
+                    self.patched_llm.lm_head.weight,
+                    default_sft_loss_func,
+                    [
+                        {"labels": chunk, "loss_weight": self.num_workers / total_tokens}
+                        for chunk in torch.split(labels, self.config.chunk_loss_size, dim=1)
+                    ],
+                    self.config.chunk_loss_size,
+                    False,
+                )
+
+            with self._dispatch_lm_head(_chunk_loss):
+                loss = self.patched_llm.train_forward(
+                    TrainInput(input_ids=input_ids, position_ids=position_ids, seq_lens=seq_lens.int())
+                )
+
             loss.backward()
             step_loss += loss.item()
 
@@ -446,15 +476,20 @@ class TrainEngine:
         # reduce loss across dp ranks for logging
         reduced_loss = torch.tensor(step_loss, device="cuda")
         dist.all_reduce(reduced_loss, op=dist.ReduceOp.AVG)
+        torch.cuda.synchronize()
         step_time = time.time() - step_t0
-        tgs = int(total_tokens_with_input / self.config.sp_size / step_time / self.dp_size / self.config.sp_size)
+        tgs = int(total_tokens_with_input / step_time / self.num_workers)
+        per_gpu_flops = total_flops / self.num_workers
+        mfu = per_gpu_flops / step_time / (self.config.gpu_peak_tflops * 1e12)
+        learning_rate = self.optimizer.param_groups[0]["lr"]
 
         self.logger.info(
             f"[SFT] Step {self.train_state.cur_step}/{self.total_steps}  "
             f"loss: {reduced_loss.item():.4f}  "
             f"grad_norm: {grad_norm:.2f}  "
-            f"lr: {self.cosine_scheduler.get_last_lr()[0]:.6f}  "
+            f"lr: {learning_rate:.6g}  "
             f"tgs: {tgs}  "
+            f"mfu: {mfu:.2%}  "
             f"tokens: {int(total_tokens_with_input)}  "
             f"time: {step_time:.2f}s  "
             f"Mem: {torch.cuda.max_memory_allocated() / 1024**3:.1f} G"
@@ -464,8 +499,10 @@ class TrainEngine:
         return {
             "loss": reduced_loss.item(),
             "grad_norm": grad_norm.item(),
+            "lr": learning_rate,
             "num_tokens": int(total_tokens_with_input),
             "tgs": tgs,
+            "mfu": mfu,
         }
 
     @torch.no_grad()
@@ -593,7 +630,6 @@ class TrainEngine:
                     global_num_tokens += (packed_batch["labels"] != -100).sum()
                 global_num_tokens = global_num_tokens.cuda()
                 dist.all_reduce(global_num_tokens, op=dist.ReduceOp.SUM)
-                global_reduce_num = global_num_tokens / self.config.sp_size
 
                 # for per_seq loss
                 # global_num_seq = 0
@@ -615,21 +651,13 @@ class TrainEngine:
             for packed_batch in step_data:
                 # prepare data
                 input_ids = packed_batch["input_ids"].cuda()
-                labels = packed_batch["labels"].cuda()
-                advantages = packed_batch["advantages"].cuda()
-                num_tokens = packed_batch["num_tokens"].cuda()
-                old_log_probs = packed_batch["old_log_probs"].cuda()
-                num_tokens_list = num_tokens.tolist()
+                shift_labels_for_sp = packed_batch["labels"].cuda()
+                advantages_sp = packed_batch["advantages"].cuda()
+                old_log_prob_sp = packed_batch["old_log_probs"].cuda()
+                position_ids = packed_batch["position_ids"].cuda()
+                seq_lens = packed_batch["seq_lens"].cuda()
 
-                position_ids = [torch.arange(num) for num in num_tokens_list]
-                position_ids = torch.cat(position_ids, dim=0).cuda().unsqueeze_(0)
-
-                shifted_labels = torch.roll(labels, shifts=-1, dims=-1)
-                shift_labels_for_sp = split_for_sp(shifted_labels, self.sp_mesh, pad_value=-100)
-                old_log_prob_sp = split_for_sp(old_log_probs, self.sp_mesh, pad_value=0)
-                advantages_sp = split_for_sp(advantages, self.sp_mesh, pad_value=0)
-
-                # Chunk mode: monkey-patch lm_head with ChunkPolicyLoss
+                # Chunk mode: monkey-patch lm_head with ChunkLoss
                 # mask is 1D [seq_sp] — excludes both -100 (mask) and SP padding (negative pad values)
                 mask = shift_labels_for_sp[0] >= 0
 
@@ -639,12 +667,12 @@ class TrainEngine:
                     _old_log_prob_sp=old_log_prob_sp,
                     _advantages_sp=advantages_sp,
                     _mask=mask,
-                    _global_reduce_num=global_reduce_num,
+                    _global_reduce_num=global_num_tokens,
                     _policy_loss_cfg=policy_loss_cfg,
                 ):
                     # Trim hidden_states to match labels (SP padding stripped)
                     hidden_states = hidden_states[:, : _shift_labels_for_sp.size(1)]
-                    loss, entropy = ChunkPolicyLoss.apply(
+                    loss, entropy = ChunkLoss.apply(
                         hidden_states[:, _mask],
                         self.patched_llm.lm_head.weight,
                         default_loss_func if self.config.loss_func is None else self.config.loss_func,
@@ -663,6 +691,7 @@ class TrainEngine:
                             )
                         ],
                         self.config.chunk_loss_size,
+                        True,
                     )
                     return loss, entropy.detach()
 
@@ -671,18 +700,18 @@ class TrainEngine:
                         TrainInput(
                             input_ids=input_ids,
                             position_ids=position_ids,
-                            seq_lens=num_tokens.int(),
+                            seq_lens=seq_lens.int(),
                         )
                     )
 
-                policy_loss = policy_loss * self.dp_size * self.config.sp_size
+                policy_loss = policy_loss * self.num_workers
                 policy_loss.backward()
 
                 with torch.no_grad():
                     # entropy is already for masked (valid) positions only
                     step_policy_loss += policy_loss.detach()
-                    total_step_entropy += entropy.sum() / global_reduce_num
-                    total_step_entropy_squared += entropy.pow(2).sum() / global_reduce_num
+                    total_step_entropy += entropy.sum() / global_num_tokens
+                    total_step_entropy_squared += entropy.pow(2).sum() / global_num_tokens
                     count_small_entropy += (entropy < 0.1).sum()
 
             # update parameters
@@ -702,7 +731,7 @@ class TrainEngine:
             dist.all_reduce(count_small_entropy, op=dist.ReduceOp.SUM)
             entropy_var = (total_step_entropy_squared - total_step_entropy**2).clamp(min=0)
             entropy_std = torch.sqrt(entropy_var)
-            tgs = int(global_reduce_num.item() / step_time / self.dp_size / self.config.sp_size)
+            tgs = int(global_num_tokens.item() / step_time / self.num_workers)
 
             self.logger.info(
                 f"[RL] (Step {rl_step}) Step "
@@ -712,10 +741,11 @@ class TrainEngine:
                 f"loss(reduced): {reduced_step_policy_loss.item():.3f}  "
                 f"entropy: {total_step_entropy:.4f}  "
                 f"entropy_std: {entropy_std:.4f}  "
-                f"small_entropy_ratio: {count_small_entropy.item() / global_reduce_num.item():.4f}  "
+                f"small_entropy_ratio: {count_small_entropy.item() / global_num_tokens.item():.4f}  "
                 f"grad_norm: {grad_norm:.2f}  "
+                f"lr: {self.optimizer.param_groups[0]['lr']:.6g}  "
                 f"tgs: {tgs}  "
-                f"tokens: {global_reduce_num.item()}  "
+                f"tokens: {global_num_tokens.item()}  "
                 f"time: {step_time:.2f}s  "
                 f"Mem: {torch.cuda.max_memory_allocated() / 1024**3:.1f} G  "
             )
@@ -727,11 +757,11 @@ class TrainEngine:
                 self.tb_writer.add_scalar("train/entropy_std", entropy_std, self.optimize_steps)
                 self.tb_writer.add_scalar(
                     "train/small_entropy_ratio",
-                    count_small_entropy.item() / global_reduce_num.item(),
+                    count_small_entropy.item() / global_num_tokens.item(),
                     self.optimize_steps,
                 )
                 self.tb_writer.add_scalar("train/tgs", tgs, self.optimize_steps)
-                self.tb_writer.add_scalar("train/global_tokens", global_reduce_num.item(), self.optimize_steps)
+                self.tb_writer.add_scalar("train/global_tokens", global_num_tokens.item(), self.optimize_steps)
 
             self.optimize_steps += 1
         self.train_state.num_optimize = self.optimize_steps
@@ -743,17 +773,12 @@ class TrainEngine:
         task_map = {item["id"]: item for item in tasks}
 
         for batch in dataloader:
-            input_ids, labels, num_tokens = (
-                batch["input_ids"].cuda(),
-                batch["labels"].cuda(),
-                batch["num_tokens"].cuda(),
-            )
-            position_ids = [torch.arange(num) for num in num_tokens]
-            position_ids = torch.cat(position_ids, dim=0).cuda().unsqueeze_(0)
-            cu_seq_lens = torch.cumsum(torch.IntTensor([0] + num_tokens.tolist()), dim=0).cuda().int()
+            input_ids = batch["input_ids"].cuda()
+            labels_for_sp = batch["labels"].cuda()
+            position_ids = batch["position_ids"].cuda()
+            seq_lens = batch["seq_lens"].cuda()
 
-            shifted_labels = torch.roll(labels, shifts=-1, dims=-1)
-            labels_for_sp = split_for_sp(shifted_labels, self.sp_mesh, pad_value=-100)
+            cu_seq_lens = torch.cumsum(torch.IntTensor([0] + seq_lens.tolist()), dim=0).cuda().int()
 
             def chunk_func(x, labels_for_sp=labels_for_sp):
                 return self.__class__._chunkly_compute_logprob_entropy(
@@ -765,28 +790,21 @@ class TrainEngine:
                     TrainInput(
                         input_ids=input_ids,
                         position_ids=position_ids,
-                        seq_lens=num_tokens.int(),
+                        seq_lens=seq_lens.int(),
                     )
                 )
 
             if self.sp_mesh and self.sp_mesh.size() > 1:
-                log_prob = dist.nn.all_gather(log_prob, group=self.sp_mesh.get_group())
-                log_prob = torch.cat(log_prob, dim=1)[:, : input_ids.numel()]
+                log_prob = torch.cat(dist.nn.all_gather(log_prob, group=self.sp_mesh.get_group()), dim=1)
+                entropy = torch.cat(dist.nn.all_gather(entropy, group=self.sp_mesh.get_group()), dim=1)
 
-            input_ids, labels, num_tokens, log_prob, entropy = (
-                input_ids.cpu(),
-                labels.cpu(),
-                num_tokens.cpu(),
-                log_prob.cpu(),
-                entropy.cpu(),
-            )
-            for i in range(num_tokens.numel()):
+            for i in range(len(batch["ids"])):
                 start, end = cu_seq_lens[i], cu_seq_lens[i + 1]
                 bid = batch["ids"][i]
                 task_map[bid]["log_probs"] = log_prob[:, start:end].flatten().tolist()  # shifted
                 task_map[bid]["train_entropy"] = entropy[:, start:end].flatten().tolist()
-                assert task_map[bid]["num_tokens"] == num_tokens[i]
-                assert num_tokens[i] == end - start
+                assert task_map[bid]["num_tokens"] == seq_lens[i]
+                assert seq_lens[i] == end - start
         return tasks
 
     # for optimizer offloading and activation
@@ -856,7 +874,7 @@ class TrainEngine:
                 "optimizer": shard_optimizer_state_dict,
                 "train_state": self.train_state.state_dict(),
             }
-            mkdir_or_exist(ckpt_dir)
+            os.makedirs(ckpt_dir, exist_ok=True)
             self.ckpt_handle = dcp.async_save(state_dict, checkpoint_id=ckpt_dir, process_group=self.gloo_group)
             wait([self.ckpt_handle])
 

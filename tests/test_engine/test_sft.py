@@ -23,7 +23,12 @@ from alloylm.engine.train_engine.dataset import (
     sft_collate_fn,
     tokenize_messages,
 )
-from alloylm.engine.train_engine.train_engine import TrainEngine, TrainEngineConfig
+from alloylm.engine.train_engine.train_engine import (
+    ChunkLoss,
+    TrainEngine,
+    TrainEngineConfig,
+    default_sft_loss_func,
+)
 from alloylm.engine.train_engine.train_infer_engine import TrainInferEngineConfig
 from alloylm.engine.train_engine.utils import FSDPConfig
 from alloylm.impl.engines.qwen.qwen2_modeling2 import FSDPQwen2ForCausalLM
@@ -43,9 +48,9 @@ class FakeTokenizer:
         return [ord(c) for c in text]
 
 
-def chat_template(converted_messages, add_generation_prompt=False):
+def chat_template(messages, add_generation_prompt=False):
     text = ""
-    for msg in converted_messages:
+    for msg in messages:
         text += f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n"
     if add_generation_prompt:
         text += "<|im_start|>assistant\n"
@@ -174,8 +179,48 @@ class SftCollateFnTest(unittest.TestCase):
         out = sft_collate_fn(batch)
 
         self.assertTrue(torch.equal(out["input_ids"], torch.tensor([[1, 2, 3, 4, 5]])))
-        self.assertTrue(torch.equal(out["labels"], torch.tensor([[-100, -100, 3, 4, 5]])))
+        self.assertTrue(torch.equal(out["shift_labels"], torch.tensor([[-100, 3, -100, 5, -100]])))
+        self.assertTrue(torch.equal(out["position_ids"], torch.tensor([[0, 1, 2, 0, 1]])))
         self.assertTrue(torch.equal(out["seq_lens"], torch.tensor([3, 2])))
+
+
+# ---------------------------------------------------------------------------
+# Chunked SFT loss
+# ---------------------------------------------------------------------------
+
+
+class ChunkCrossEntropyLossTest(unittest.TestCase):
+    def test_matches_full_cross_entropy_loss_and_gradients(self):
+        torch.manual_seed(0)
+        hidden = torch.randn(1, 7, 5, requires_grad=True)
+        weight = torch.randn(11, 5, requires_grad=True)
+        labels = torch.randint(0, 11, (1, 7))
+        loss_weight = 0.25
+
+        chunk_size = 3
+        chunked_loss = ChunkLoss.apply(
+            hidden,
+            weight,
+            default_sft_loss_func,
+            [{"labels": chunk, "loss_weight": loss_weight} for chunk in torch.split(labels, chunk_size, dim=1)],
+            chunk_size,
+            False,
+        )
+        chunked_loss.backward()
+        chunked_hidden_grad = hidden.grad.clone()
+        chunked_weight_grad = weight.grad.clone()
+
+        hidden.grad = None
+        weight.grad = None
+        logits = torch.nn.functional.linear(hidden, weight).float()
+        full_loss = (
+            torch.nn.functional.cross_entropy(logits.flatten(0, 1), labels.flatten(), reduction="sum") * loss_weight
+        )
+        full_loss.backward()
+
+        self.assertTrue(torch.allclose(chunked_loss, full_loss))
+        self.assertTrue(torch.allclose(chunked_hidden_grad, hidden.grad, atol=1e-6))
+        self.assertTrue(torch.allclose(chunked_weight_grad, weight.grad, atol=1e-6))
 
 
 # ---------------------------------------------------------------------------

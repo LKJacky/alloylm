@@ -306,6 +306,14 @@ def split_for_sequence_parallel(input, dim: int, sp_mesh):
     return output
 
 
+def pad_and_split_for_sp(sequence, value, sp_size, sp_rank, dim=-1):
+    sequence = pad_to_multiple_of(sequence, value, sp_size, dim=dim)
+    dim_size = sequence.size(dim)
+    chunk_size = dim_size // sp_size
+    start = sp_rank * chunk_size
+    return sequence.narrow(dim, start, chunk_size)
+
+
 @_no_grad
 def clip_grad_norm_(
     parameters,

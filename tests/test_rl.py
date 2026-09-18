@@ -68,7 +68,6 @@ default_config = UnifiedConfig(
     max_concurrency_per_node=128,
     cache_max_entry_count=0.2,
     max_prefill_length=1024,
-    sp_size=1,
     chat_template=Qwen3ChatTemplate,
     tool_pattern=QWEN_TOOL_PATTERN,
 )
@@ -206,13 +205,13 @@ class TestRLSystemQuick(RLTest):
     async def test_rl_gpu2(self):
         shutil.rmtree("work_dirs/tests/rl", ignore_errors=True)
         config = copy.deepcopy(default_config)
+        config.llm_config.fsdp_config.train_mesh["mesh_shape"] = (1, 2)
         config.total_training_steps = 2
         config.checkpoint_interval = 1
         config.roll_out_bs = 2
         config.num_rl_group = 8
         config.filter_group = "none"
         config.num_workers = 2
-        config.sp_size = 2
         config.work_dir = "work_dirs/tests/rl"
         trainer = create_trainer(config)
         await trainer.lazy_init()

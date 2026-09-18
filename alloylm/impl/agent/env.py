@@ -8,13 +8,14 @@ decorator), :meth:`BaseEnv.call_tool` dispatches a returned tool call, and
 :meth:`BaseEnv.execute` runs the tool calls of an assistant message.
 """
 
+import asyncio
 import inspect
 import json
 from collections.abc import Callable
 from types import UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
-from openai.types.chat import ChatCompletionMessage
+from alloylm.utils import get_logger
 
 _JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
@@ -72,28 +73,20 @@ class BaseEnv:
     :meth:`execute`.
     """
 
-    def __init__(self, expose_get_tool_definitions: bool = False):
-        if expose_get_tool_definitions:
-            self.get_tool_definitions = BaseEnv.node_tool(description="Get tool definitions")(
-                self.get_tool_definitions
-            )
+    def __init__(
+        self,
+        expose_get_tool_definitions: bool = False,
+        exec_time_warning_threshold: float = 10,
+    ):
+        self.exec_time_warning_threshold = exec_time_warning_threshold
+        self.expose_get_tool_definitions = expose_get_tool_definitions
 
     @classmethod
     async def create_env(cls, **kwargs):
         """Async factory returning ``cls(**kwargs)``."""
         return cls(**kwargs)
 
-    async def execute(self, messages: ChatCompletionMessage) -> str:
-        """Run the tool calls of an assistant message against this env.
-
-        Each ``tool_calls`` entry is dispatched through :meth:`execute_call`
-        and the results are joined into one string; a message without tool
-        calls returns its content.
-        """
-        results = [self.execute_call(call) for call in messages.tool_calls or []]
-        return "\n".join(results) if results else (messages.content or "")
-
-    def execute_call(self, call) -> str:
+    async def execute_call(self, call) -> str:
         """Dispatch a single tool call and return its result string."""
         name = call.function.name
         arguments = call.function.arguments
@@ -103,7 +96,12 @@ class BaseEnv:
             return f"Invalid arguments for {name}: {arguments}"
         if not isinstance(parsed, dict):
             return f"Invalid arguments for {name}: expected a JSON object"
-        return self.call_tool(name, parsed)
+        task = asyncio.create_task(self.call_tool(name, parsed))
+        while True:
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), self.exec_time_warning_threshold)
+            except TimeoutError:
+                get_logger().warning(f"Execution of {name} timed out after {self.exec_time_warning_threshold} seconds")
 
     async def close(self):
         pass
@@ -140,6 +138,11 @@ class BaseEnv:
                 tool = getattr(value, "_node_tool", None)
                 if tool is not None:
                     decorated[name] = tool
+        if self.expose_get_tool_definitions:
+            decorated["get_tool_definitions"] = {
+                "description": "Get tool definitions",
+                "parameters": None,
+            }
         return [
             {
                 "type": "function",
@@ -162,7 +165,7 @@ class BaseEnv:
         """
         return self.tools()
 
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         """Dispatch a returned OpenAI tool call (function ``name`` + parsed
         ``arguments``) to the matching operation and return its result string.
 
@@ -174,7 +177,10 @@ class BaseEnv:
         if not isinstance(arguments, dict):
             return f"Invalid arguments for {name}: expected a JSON object"
         try:
-            result = tool(**arguments)
+            if inspect.iscoroutinefunction(tool):
+                result = await tool(**arguments)
+            else:
+                result = tool(**arguments)
         except Exception as e:  # noqa
             return f"Error calling {name}: {e}"
         return result if isinstance(result, str) else str(result)

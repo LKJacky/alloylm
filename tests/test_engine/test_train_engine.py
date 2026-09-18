@@ -10,6 +10,7 @@ from openai import AsyncClient
 
 from alloylm.engine.infer_engine.engine import InferEngineConfig
 from alloylm.engine.model import AlloyLMModelConfig
+from alloylm.engine.train_engine.dataset import task_collate_fn
 from alloylm.engine.train_engine.train_engine import TrainEngineConfig
 from alloylm.engine.train_engine.train_infer_engine import (
     RLInput,
@@ -21,6 +22,45 @@ from alloylm.impl.engines.qwen.qwen2_modeling2 import FSDPQwen2ForCausalLM
 from alloylm.test_utils import CudaAsyncTestCase
 
 MODEL_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
+
+
+class TaskCollateFnTest(unittest.TestCase):
+    def test_sequence_parallel_shards_are_aligned(self):
+        batch = [
+            [
+                {
+                    "id": "a",
+                    "input_ids": [1, 2, 3],
+                    "labels": [-100, 2, 3],
+                    "num_tokens": 3,
+                    "advantages": 1.0,
+                    "log_probs": [0.1, 0.2, 0.3],
+                    "train_entropy": [0.4, 0.5, 0.6],
+                },
+                {
+                    "id": "b",
+                    "input_ids": [4, 5],
+                    "labels": [4, 5],
+                    "num_tokens": 2,
+                    "advantages": -1.0,
+                    "log_probs": [0.7, 0.8],
+                    "train_entropy": [0.9, 1.0],
+                },
+            ]
+        ]
+
+        shards = [task_collate_fn(batch, sp_size=2, sp_rank=rank) for rank in range(2)]
+
+        for key, expected in {
+            "input_ids": [1, 2, 3, 4, 5, 0],
+            "labels": [2, 3, -100, 5, -100, -100],
+            "position_ids": [0, 1, 2, 0, 1, 0],
+            "advantages": [1.0, 1.0, 1.0, -1.0, -1.0, 0.0],
+        }.items():
+            actual = torch.cat([shard[key] for shard in shards], dim=1).flatten()
+            self.assertTrue(torch.equal(actual, torch.tensor(expected, dtype=actual.dtype)))
+
+        self.assertTrue(torch.equal(shards[0]["seq_lens"], torch.tensor([3, 2, 1])))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

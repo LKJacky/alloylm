@@ -1,11 +1,11 @@
+import asyncio
 import time
-from logging import getLogger
 
 from openai import AsyncClient
 
-from .env import BaseEnv
+from alloylm.utils import get_logger
 
-logger = getLogger(__name__)
+from .env import BaseEnv
 
 
 class BaseAgent:
@@ -34,7 +34,7 @@ class BaseAgent:
     async def chat(self, messages):
         t0 = time.time()
         response = await self.client.chat.completions.create(
-            messages=messages, tools=self.env.tools() if self.env else None
+            messages=messages, tools=self.env.tools() if self.env is not None else None
         )
         self.used_tokens.extend(
             [response.usage.prompt_tokens - sum(self.used_tokens), response.usage.completion_tokens]
@@ -44,9 +44,9 @@ class BaseAgent:
         return response.choices[0].message
 
     async def execute(self, call) -> str:
-        t0 = time.time()
-        response: str = self.env.execute_call(call)
-        self.exec_time += time.time() - t0
+        t0 = asyncio.get_event_loop().time()
+        response: str = await self.env.execute_call(call)
+        self.exec_time += asyncio.get_event_loop().time() - t0
         return response
 
     async def solve(self, messages=()):
@@ -73,11 +73,9 @@ class BaseAgent:
         self.__class__.chat_time += self.chat_time
         self.__class__.exec_time += self.exec_time
         if time.time() - self.__class__.last_log_time > 60:
-            logger.info(
+            get_logger().info(
                 f"Agent time ratio: chat {self.__class__.chat_time:.2f}s / exec {self.__class__.exec_time:.2f}s, {self.__class__.chat_time / (self.__class__.exec_time + 1e-6):.2f}x"
             )
             self.__class__.last_log_time = time.time()
             self.__class__.chat_time = 0
             self.__class__.exec_time = 0
-
-        await self.client.close()

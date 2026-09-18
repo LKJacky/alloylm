@@ -149,7 +149,7 @@ class EvalRunner:
         self.datasets = datasets
         self.work_dir = work_dir
         self.resume_enabled = resume
-        self.logger = get_logger(path=self.work_dir + "/eval.log")
+        self.logger = get_logger(path=self.work_dir + "/eval.log", force_recreate=True)
 
     async def _run_eval_item(self, task_item: TaskItem):
         try:
@@ -172,9 +172,9 @@ class EvalRunner:
         for dataset in self.datasets:
             resume_path = os.path.join(self.work_dir, f"{dataset.config.name}.jsonl")
             if os.path.exists(resume_path):
-                print(f"Resuming from {resume_path}")
                 data = load_jsonl(resume_path)
                 resumed[dataset.config.name] = {d["id"]: TaskData(**d) for d in data}
+                self.logger.info(f"Resuming from {resume_path} with {len(resumed[dataset.config.name])} items")
         return resumed
 
     async def run(self, semaphore):
@@ -232,12 +232,12 @@ class EvalRunner:
                 origin_num = len(dataset)
                 valid = [r for r in ds_results[name] if r is not None]
                 if len(valid) < origin_num:
-                    print(f"Warning: {origin_num - len(valid)} samples failed during evaluation of {name}.")
+                    self.logger.info(f"Warning: {origin_num - len(valid)} samples failed during evaluation of {name}.")
                 summary = dataset.summary(valid)
                 results.append(summary)
-                print(f"Dataset {name} eval done, main metric: {summary.metric:.4f}")
+                self.logger.info(f"Dataset {name} eval done, main metric: {summary.metric:.4f}")
         except Exception as e:  # noqa: BLE001
-            print("Error in EvalRunner:", e, traceback.format_exc())
+            self.logger.info(f"Error in EvalRunner: {e}\n {traceback.format_exc()}")
             results = []
         finally:
             for task in dump_tasks:
@@ -261,8 +261,8 @@ class EvalRunner:
             df = pd.DataFrame(columns=list(results[0].model_dump(exclude="task_data").keys()))
             for result in results:
                 df = pd.concat([df, pd.DataFrame([result.model_dump(exclude="task_data")])], ignore_index=True)
-            print(df.to_markdown(index=False))
-        print(f"Evaluation use {int(time.time() - t0)} seconds\nEvaluation Results:")
+            self.logger.info(df.to_markdown(index=False))
+        self.logger.info(f"Evaluation use {int(time.time() - t0)} seconds\nEvaluation Results:")
 
         # For single-dataset backward compatibility, return the single summary directly
         if len(self.datasets) == 1 and len(results) == 1:
@@ -292,7 +292,7 @@ async def run_eval(config: EvalConfig):
             dataset.config.infer_args.model_url = config.url
         if config.model_name is not None:
             dataset.config.infer_args.model_name = config.model_name
-        print(f"build {dataset.config.name}, total {len(dataset)} samples")
+        get_logger().info(f"build {dataset.config.name}, total {len(dataset)} samples")
 
     if config.one_by_one:
         for dataset in datasets:

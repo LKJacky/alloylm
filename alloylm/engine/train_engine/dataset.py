@@ -11,6 +11,8 @@ from torch import distributed as dist
 from torch.utils.data import ConcatDataset, Dataset
 from transformers import AutoTokenizer
 
+from .utils import pad_and_split_for_sp
+
 
 def distangle_train_or_not_train(messages: list[dict], chat_template):
     # distinguish between has loss or not.
@@ -127,12 +129,21 @@ class SoftPackDataset(torch.utils.data.Dataset):
 
 
 @torch.inference_mode()
-def task_collate_fn(batch):
+def task_collate_fn(batch, sp_rank=0, sp_size=1):
     def collated_one_sample(single_batch):
+        def pad_and_split(x, value=0):
+            if x is None:
+                return None
+            return pad_and_split_for_sp(torch.as_tensor(x), value, sp_size, sp_rank, dim=-1)
+
         keys = single_batch[0].keys()
-        input_ids = [x for item in single_batch for x in item["input_ids"]]
-        labels = [x for item in single_batch for x in item["labels"]]
+        input_ids = torch.tensor([x for item in single_batch for x in item["input_ids"]])
+        labels = torch.tensor([x for item in single_batch for x in item["labels"]])
         num_tokens = [item["num_tokens"] for item in single_batch]
+        position_ids = torch.tensor([x for n in num_tokens for x in range(n)])
+
+        shift_labels = torch.roll(labels, shifts=-1, dims=-1)
+        shift_labels[torch.tensor(num_tokens).cumsum(0) - 1] = -100
 
         advantages = (
             [x for item in single_batch for x in [item["advantages"]] * item["num_tokens"]]
@@ -142,13 +153,24 @@ def task_collate_fn(batch):
         old_log_probs = [x for item in single_batch for x in item["log_probs"]] if "log_probs" in keys else None
         entropy = [x for item in single_batch for x in item["train_entropy"]] if "train_entropy" in keys else None
 
+        input_ids = pad_and_split(input_ids)
+        shift_labels = pad_and_split(shift_labels, value=-100)
+        position_ids = pad_and_split(position_ids)
+        advantages = pad_and_split(advantages)
+        old_log_probs = pad_and_split(old_log_probs)
+        entropy = pad_and_split(entropy)
+        padding = input_ids.numel() * sp_size - sum(num_tokens)
+        seq_lens = [*num_tokens, *([padding] if padding else [])]
+
         return {
-            "input_ids": torch.tensor(input_ids).unsqueeze(0),
-            "labels": torch.tensor(labels).unsqueeze(0),
-            "num_tokens": torch.tensor(num_tokens),
-            "advantages": torch.tensor(advantages).unsqueeze(0) if advantages is not None else None,
-            "old_log_probs": torch.tensor(old_log_probs).unsqueeze(0) if old_log_probs is not None else None,
-            "entropy": torch.tensor(entropy).unsqueeze(0) if entropy is not None else None,
+            "input_ids": input_ids.unsqueeze(0),
+            "labels": shift_labels.unsqueeze(0),
+            "position_ids": position_ids.unsqueeze(0),
+            "seq_lens": torch.tensor(seq_lens),
+            # "num_tokens": torch.tensor(num_tokens),
+            "advantages": advantages.unsqueeze(0) if advantages is not None else None,
+            "old_log_probs": old_log_probs.unsqueeze(0) if old_log_probs is not None else None,
+            "entropy": entropy.unsqueeze(0) if entropy is not None else None,
             "ids": [item["id"] for item in single_batch],
         }
 
@@ -157,7 +179,7 @@ def task_collate_fn(batch):
 
 
 @torch.inference_mode()
-def sft_collate_fn(batch):
+def sft_collate_fn(batch, sp_size=1, sp_rank=0):
     """Collate a list of ``SFTDataset`` samples into one packed sequence.
 
     Each sample is the dict returned by ``SFTDataset.__getitem__`` with
@@ -166,12 +188,27 @@ def sft_collate_fn(batch):
     plus a ``[num_seqs]`` ``seq_lens`` tensor, matching what
     ``TrainEngine.step_sft`` consumes.
     """
-    input_ids = [x for item in batch for x in item["input_ids"]]
-    labels = [x for item in batch for x in item["labels"]]
+    input_ids = torch.tensor([x for item in batch for x in item["input_ids"]])
+    labels = torch.tensor([x for item in batch for x in item["labels"]])
     seq_lens = [x for item in batch for x in item["seq_lens"]]
+    position_ids = torch.tensor([x for n in seq_lens for x in range(n)])
+
+    # Shift labels without training across packed-sequence boundaries.
+    shift_labels = torch.roll(labels, shifts=-1, dims=-1)
+    shift_labels[torch.tensor(seq_lens).cumsum(0) - 1] = -100
+
+    # deal sp
+    input_ids = pad_and_split_for_sp(input_ids, value=0, sp_size=sp_size, sp_rank=sp_rank, dim=-1)
+    shift_labels = pad_and_split_for_sp(shift_labels, value=-100, sp_size=sp_size, sp_rank=sp_rank, dim=-1)
+    position_ids = pad_and_split_for_sp(position_ids, value=0, sp_size=sp_size, sp_rank=sp_rank, dim=-1)
+    padding = input_ids.numel() * sp_size - sum(seq_lens)
+    if padding:
+        seq_lens.append(padding)
+
     return {
-        "input_ids": torch.tensor(input_ids).unsqueeze(0),
-        "labels": torch.tensor(labels).unsqueeze(0),
+        "input_ids": input_ids.unsqueeze(0),
+        "shift_labels": shift_labels.unsqueeze(0),
+        "position_ids": position_ids.unsqueeze(0),
         "seq_lens": torch.tensor(seq_lens),
     }
 

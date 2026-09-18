@@ -16,7 +16,6 @@ from torch.distributed._composable.fsdp import (
 )
 from torch.distributed._functional_collectives import (
     all_to_all_single,
-    all_to_all_single_autograd,
 )
 from torch.distributed._tensor import DTensor
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -55,8 +54,6 @@ from alloylm.engine.train_engine.utils import (
     HFCheckpointLoader,
     get_engine_logger,
     lazy_init_fn,
-    pad_to_multiple_of,
-    split_for_sequence_parallel,
 )
 
 from .flash_attn import flash_attn_varlen_fwd
@@ -68,28 +65,24 @@ def all_to_all(
     input: torch.Tensor, scatter_dim: int, gather_dim: int, mesh: DeviceMesh, training=True
 ) -> torch.Tensor:
     world_size = mesh.size()
-    split_size = input.size(scatter_dim) // world_size
+    scatter_size = input.size(scatter_dim)
+    assert scatter_size % world_size == 0, (
+        f"Dimension {scatter_dim} ({scatter_size}) must be divisible by the sequence parallel size ({world_size})"
+    )
+    split_size = scatter_size // world_size
     input_split_sizes = [split_size] * world_size
     output_split_sizes = input_split_sizes
 
-    input = input.contiguous()
-    input = input.movedim(scatter_dim, 0)
-    if training:
-        all_to_all_function = all_to_all_single_autograd
-    else:
-        all_to_all_function = all_to_all_single
+    input = input.movedim(scatter_dim, 0).contiguous()
 
-    output = all_to_all_function(
+    output = all_to_all_single(  # all_to_all_single has support autograd in latest torch
         input,
         group=mesh.get_group(),
         input_split_sizes=input_split_sizes,
         output_split_sizes=output_split_sizes,
     )
-    output = output.transpose(0, scatter_dim)
-
-    output_list = [t for t in torch.tensor_split(output, world_size, scatter_dim)]
-    output = torch.cat(output_list, dim=gather_dim).contiguous()
-    return output
+    output_chunks = [chunk.movedim(0, scatter_dim) for chunk in output.split(split_size, dim=0)]
+    return torch.cat(output_chunks, dim=gather_dim).contiguous()
 
 
 class DisableGcGollect:
@@ -186,20 +179,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """This is the equivalent of torch.repeat_interleave(x, dim=1,
-    repeats=n_rep).
-
-    The hidden states go from (batch, num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen,
-    head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 class QwenRMSNorm(nn.Module):
@@ -328,7 +307,7 @@ class Qwen2Attention(nn.Module):
 
     def forward_training(
         self: "Qwen2Attention",
-        query_states: torch.Tensor,
+        query_states: torch.Tensor,  # batch, seqlen, num_heads, head_dim
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         cu_seq_lens_q: torch.Tensor,
@@ -346,24 +325,26 @@ class Qwen2Attention(nn.Module):
             window_size = (self.config.sliding_window - 1, self.config.sliding_window - 1)
         else:
             window_size = (None, None)
-
         if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
-            raise NotImplementedError("Sequence parallelism is not supported in training mode yet.")
+            # sp, each rank compute only a part of heads
             sp_size = sequence_parallel_mesh.size()
-            num_kv_heads = key_states.size(1)
+            num_kv_heads = key_states.size(2)
             if sp_size > num_kv_heads:
                 assert sp_size % num_kv_heads == 0
-                key_states = repeat_kv(key_states, sp_size // num_kv_heads)
-                value_states = repeat_kv(value_states, sp_size // num_kv_heads)
+                repeats = sp_size // num_kv_heads
+                key_states = torch.repeat_interleave(key_states, repeats, dim=2)
+                value_states = torch.repeat_interleave(value_states, repeats, dim=2)
+            else:
+                assert num_kv_heads % sp_size == 0
 
             query_states = all_to_all(
-                query_states, scatter_dim=1, gather_dim=2, mesh=sequence_parallel_mesh, training=self.training
+                query_states, scatter_dim=2, gather_dim=1, mesh=sequence_parallel_mesh, training=self.training
             )
             key_states = all_to_all(
-                key_states, scatter_dim=1, gather_dim=2, mesh=sequence_parallel_mesh, training=self.training
+                key_states, scatter_dim=2, gather_dim=1, mesh=sequence_parallel_mesh, training=self.training
             )
             value_states = all_to_all(
-                value_states, scatter_dim=1, gather_dim=2, mesh=sequence_parallel_mesh, training=self.training
+                value_states, scatter_dim=2, gather_dim=1, mesh=sequence_parallel_mesh, training=self.training
             )
 
         # (bs, n , qh // sp, d)
@@ -382,7 +363,7 @@ class Qwen2Attention(nn.Module):
         )
         if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
             attn_output = all_to_all(
-                attn_output, scatter_dim=1, gather_dim=2, mesh=sequence_parallel_mesh, training=self.training
+                attn_output, scatter_dim=0, gather_dim=1, mesh=sequence_parallel_mesh, training=self.training
             )
 
         return attn_output, None
@@ -674,9 +655,9 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
         cu_seq_lens_k=None,
         max_length_q=None,
         max_length_k=None,
-        sequence_parallel_mesh=None,
         **kwargs,
     ):
+
         _input_ids = input_ids
         _position_ids = position_ids
         if cu_seq_lens_q is None:
@@ -690,28 +671,6 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
             max_length_k = max_length_q
         else:
             assert all(x is not None for x in [cu_seq_lens_k, max_length_q, max_length_k])
-
-        if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
-            multiple_of = sequence_parallel_mesh.size() * 1
-        else:
-            multiple_of = 1
-
-        _input_ids = pad_to_multiple_of(_input_ids, 0, multiple_of, 1)
-        _position_ids = pad_to_multiple_of(_position_ids, 0, multiple_of, 1)
-
-        num_padded_tokens = _input_ids.numel() - input_ids.numel()
-
-        if sequence_parallel_mesh and sequence_parallel_mesh.size() > 1:
-            _input_ids = split_for_sequence_parallel(_input_ids, dim=1, sp_mesh=sequence_parallel_mesh)
-            _position_ids = split_for_sequence_parallel(_position_ids, dim=1, sp_mesh=sequence_parallel_mesh)
-
-        if self.training and num_padded_tokens > 0:
-            assert torch.any(cu_seq_lens_k == cu_seq_lens_q)
-            cu_seq_lens_q = torch.cat((cu_seq_lens_q, cu_seq_lens_q[-1:] + num_padded_tokens))
-            cu_seq_lens_k = cu_seq_lens_q
-
-            max_length_q = max(max_length_q, num_padded_tokens)
-            max_length_k = max_length_q
 
         return (_input_ids, _position_ids), {
             "cu_seq_lens_q": cu_seq_lens_q,
@@ -755,6 +714,52 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
         if "attention_args" not in kwargs:
             (input_ids, position_ids), kwargs = self.prepare_train_args(input_ids, position_ids, **kwargs)
         return super().forward(input_ids=input_ids, position_ids=position_ids, **kwargs)
+
+    def compute_flops(self, seqlens: list[int]) -> int:
+        """Estimate forward-and-backward FLOPs for a packed training batch.
+
+        Counts multiply-adds in linear layers and causal attention as two FLOPs. Elementwise operations, embeddings,
+        normalization, and optimizer updates are intentionally excluded.
+        """
+        if any(seqlen < 0 for seqlen in seqlens):
+            raise ValueError("sequence lengths must be non-negative")
+
+        config = self.config
+        num_tokens = sum(seqlens)
+        hidden_size = config.hidden_size
+        head_dim = getattr(config, "head_dim", None) or hidden_size // config.num_attention_heads
+        query_size = config.num_attention_heads * head_dim
+        key_value_size = config.num_key_value_heads * head_dim
+
+        # Q/K/V and output projections. The factor of six accounts for the
+        # multiply-adds in the forward pass and both backward-pass matmuls.
+        attention_weights = 2 * hidden_size * (query_size + key_value_size)
+        if isinstance(config, Qwen3MoeConfig):
+            router_weights = hidden_size * config.num_experts
+            active_expert_weights = 3 * hidden_size * config.moe_intermediate_size * config.num_experts_per_tok
+            layer_weights = attention_weights + router_weights + active_expert_weights
+        else:
+            layer_weights = attention_weights + 3 * hidden_size * config.intermediate_size
+
+        linear_flops = 6 * num_tokens * (config.num_hidden_layers * layer_weights + hidden_size * config.vocab_size)
+
+        # Flash attention only evaluates the causal region. Sliding-attention
+        # layers additionally cap the number of attended keys per query.
+        layer_types = getattr(config, "layer_types", ["full_attention"] * config.num_hidden_layers)
+        attention_flops = 0
+        for layer_idx in range(config.num_hidden_layers):
+            window = config.sliding_window if layer_types[layer_idx] == "sliding_attention" else None
+            attended_pairs = 0
+            for seqlen in seqlens:
+                if window is None or seqlen <= window:
+                    attended_pairs += seqlen * (seqlen + 1) // 2
+                else:
+                    attended_pairs += window * seqlen - window * (window - 1) // 2
+            # QK^T and AV each perform a multiply-add per attended pair;
+            # backward costs twice their combined forward cost.
+            attention_flops += 12 * query_size * attended_pairs
+
+        return linear_flops + attention_flops
 
     # for hf checkpoint loading
 
