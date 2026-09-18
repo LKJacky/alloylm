@@ -391,7 +391,7 @@ class APIServer:
                     "choices": [
                         {
                             "index": 0,
-                            "message": [],
+                            "message": {"role": "assistant", "content": ""},
                             "finish_reason": "stop",
                         }
                     ],
@@ -436,7 +436,7 @@ class APIServer:
                     "choices": [
                         {
                             "index": 0,
-                            "message": [],
+                            "message": {"role": "assistant", "content": ""},
                             "finish_reason": "error",
                         }
                     ],
