@@ -2,17 +2,20 @@ import copy
 import re
 import unittest
 
+import flashinfer
 import torch
 from transformers import AutoTokenizer
 
 from alloylm.engine.spmd import SPMDActor, SPMDActorConfig, init_dist
 from alloylm.impl.engines.qwen import Qwen3ChatTemplate
+from alloylm.impl.engines.qwen.flash_attn import flash_attn_varlen_fwd
 from alloylm.impl.engines.qwen.qwen2_modeling2 import (
     FSDPConfig,
     FSDPQwen2ForCausalLM,
 )
 from alloylm.impl.engines.qwen.swa_cache import SwaCacheManager
 from alloylm.test_utils import CudaAsyncTestCase, collect_garbage
+from alloylm.utils import get_logger
 
 
 class SequenceParallelModel:
@@ -259,6 +262,100 @@ class TestQwenModel(CudaAsyncTestCase):
             await model.close()
         finally:
             model.shutdown()
+
+    async def test_window_size(self):
+        window_size = 4096
+        model = FSDPQwen2ForCausalLM.from_pretrained(
+            self.model_path,
+            fsdp_config=FSDPConfig(
+                train_mesh={"device_type": "cuda", "mesh_shape": (1, 1), "mesh_dim_names": ["fsdp", "sp"]},
+                infer_mesh={"device_type": "cuda", "mesh_shape": (1, 1), "mesh_dim_names": ["dp", "tp"]},
+                lm_head_dtype=torch.bfloat16,
+            ),
+            window_size=window_size,
+        )
+        model_str = str(model)
+        get_logger().info(model_str)
+        self.assertTrue("window size=4096" in model_str)
+
+
+class TestKernel(CudaAsyncTestCase):
+    def test_flash_attention_window_size_4096(self):
+        window_size = 4096
+        sequence_length = window_size + 1
+        head_dim = 64
+
+        query = torch.zeros(sequence_length, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+        key = torch.zeros_like(query)
+        value = torch.zeros_like(query)
+        value[0] = window_size / 2
+        cu_seq_lens = torch.tensor([0, sequence_length], device="cuda", dtype=torch.int32)
+
+        output, _ = flash_attn_varlen_fwd(
+            query,
+            key,
+            value,
+            cu_seq_lens,
+            cu_seq_lens,
+            sequence_length,
+            sequence_length,
+            head_dim**-0.5,
+            True,
+            window_size - 1,
+            window_size - 1,
+        )
+
+        # Position 4095 attends positions 0..4095 (4096 tokens), while
+        # position 4096 attends positions 1..4096 and must exclude position 0.
+        torch.testing.assert_close(output[-2].float(), torch.full_like(output[-2].float(), 0.5))
+        torch.testing.assert_close(output[-1].float(), torch.zeros_like(output[-1].float()))
+
+    def test_flashinfer_prefill_window_size_4096(self):
+        window_size = 4096
+        sequence_length = window_size + 1
+        head_dim = 64
+
+        query = torch.zeros(sequence_length, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+        key = torch.zeros_like(query)
+        value = torch.zeros_like(query)
+        value[0] = window_size / 2
+
+        output = flashinfer.single_prefill_with_kv_cache(
+            query,
+            key,
+            value,
+            causal=True,
+            window_left=window_size - 1,
+        )
+
+        torch.testing.assert_close(output[-2].float(), torch.full_like(output[-2].float(), 0.5))
+        torch.testing.assert_close(output[-1].float(), torch.zeros_like(output[-1].float()))
+
+    def test_flashinfer_decode_window_size_4096(self):
+        window_size = 4096
+        sequence_length = window_size + 1
+        head_dim = 64
+
+        query = torch.zeros(1, head_dim, device="cuda", dtype=torch.bfloat16)
+        key = torch.zeros(sequence_length, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+        value = torch.zeros_like(key)
+        value[0] = window_size / 2
+
+        included = flashinfer.single_decode_with_kv_cache(
+            query,
+            key[:-1],
+            value[:-1],
+            window_left=window_size - 1,
+        )
+        excluded = flashinfer.single_decode_with_kv_cache(
+            query,
+            key,
+            value,
+            window_left=window_size - 1,
+        )
+
+        torch.testing.assert_close(included.float(), torch.full_like(included.float(), 0.5))
+        torch.testing.assert_close(excluded.float(), torch.zeros_like(excluded.float()))
 
 
 class TestQwen3ChatTemplate(unittest.TestCase):

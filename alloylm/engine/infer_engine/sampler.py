@@ -6,7 +6,7 @@ from torch import distributed as dist
 
 class BatchSampler:
     def __init__(self, real_vocab_size=-1, sample_batch_size=128):
-        self.real_vocab_size = real_vocab_size
+        self.real_vocab_size = real_vocab_size  # TODO delete or fixed
 
         self.random_generator = torch.Generator(device="cuda")
         if dist.is_initialized():

@@ -72,6 +72,7 @@ class OneStepTask(Task):
 class OneStepJsonlDataset(Dataset):
     def __init__(self, config: JsonlDatasetConfig):
         super().__init__(config)
+        raise NotImplementedError("OneStepJsonlDataset is not implemented yet.")
 
     def __getitem__(self, index):
         messages = copy.deepcopy(self.data[index]["message"])

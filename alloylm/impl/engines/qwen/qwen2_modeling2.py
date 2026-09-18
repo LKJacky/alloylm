@@ -47,7 +47,12 @@ from transformers.models.qwen3_moe import Qwen3MoeConfig
 from transformers.utils import TransformersKwargs
 
 from alloylm.engine.infer_engine.utils import GatherContext
-from alloylm.engine.model import AlloyLMModel, DeviceSession, TrainInput
+from alloylm.engine.model import (
+    AlloyLMModel,
+    AlloyLMModelConfig,
+    DeviceSession,
+    TrainInput,
+)
 from alloylm.engine.train_engine.utils import (
     DEFAULT_FSDP_CONFIG,
     FSDPConfig,
@@ -421,6 +426,9 @@ class Qwen2Attention(nn.Module):
                 self.o_proj, tp_mesh, parallelize_plan=RowwiseParallel()
             )  # input-dim shard
 
+    def extra_repr(self):
+        return super().extra_repr() + f"window size={self.sliding_window}"
+
 
 class Qwen2DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen2Config, layer_idx: int):
@@ -769,6 +777,7 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
         pretrained_model_name_or_path: str | None = None,
         *model_args,
         fsdp_config: FSDPConfig = DEFAULT_FSDP_CONFIG,
+        window_size=-1,
         **kwargs,
     ) -> "FSDPQwen2ForCausalLM":
         class HFCheckpointLoaderWithMapping(HFCheckpointLoader):
@@ -832,6 +841,10 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
 
         assert dist.is_initialized(), "FSDP loading requires torch.distributed to be initialized"
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        if window_size != -1:
+            config.use_sliding_window = True
+            config.sliding_window = window_size
+            config.layer_types = ["sliding_attention"] * config.num_hidden_layers
         fsdp_config.init_device_mesh()
         with torch.device("meta"):
             model = cls(config, fsdp_config=fsdp_config).to(fsdp_config.shard_dtype)
@@ -1061,7 +1074,7 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
             head_dim_qk=attention_args.kv_cache.shape[-1],
             page_size=cache.block_size,
             causal=True,
-            window_left=self.config.ws[0] if self.config.use_sliding_window else -1,
+            window_left=self.config.ws[0] - 1 if self.config.use_sliding_window else -1,
             q_data_type=attention_args.kv_cache.dtype,
             kv_data_type=attention_args.kv_cache.dtype,
         )
@@ -1096,7 +1109,7 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
             num_kv_heads=attention_args.kv_cache.shape[-2],
             head_dim=attention_args.kv_cache.shape[-1],
             page_size=cache.block_size,
-            window_left=self.config.ws[0] if self.config.use_sliding_window else -1,
+            window_left=self.config.ws[0] - 1 if self.config.use_sliding_window else -1,
             q_data_type=attention_args.kv_cache.dtype,
             kv_data_type=attention_args.kv_cache.dtype,
             seq_lens=attention_args.num_cache_tokens,
@@ -1178,3 +1191,13 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
         with DisableGcGollect():
             ctx["graph"].replay()
         return cache.graph_logits[:, :batch_size]
+
+
+class FSDPQwen2ForCausalLMConfig(AlloyLMModelConfig):
+    window_size: int = -1
+    model_cls: object = FSDPQwen2ForCausalLM
+
+    def build(self) -> "AlloyLMModel":
+        assert self.path, "Model path must be specified in the configuration."
+        assert self.model_cls is FSDPQwen2ForCausalLM, "Model class must be FSDPQwen2ForCausalLM"
+        return self.model_cls.from_pretrained(self.path, fsdp_config=self.fsdp_config, window_size=self.window_size)
