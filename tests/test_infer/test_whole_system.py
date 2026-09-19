@@ -43,7 +43,7 @@ class TestLaunchSystem(CudaAsyncTestCase):
                 model="ALLOYLM",
                 messages=messages,
                 max_completion_tokens=4096,
-                extra_body={"top_k": 1, "sesion_id": uuid_val},
+                extra_body={"top_k": 1, "session_id": uuid_val},
             )
             output_str = output.choices[0].message.content
             messages.append({"role": "assistant", "content": output_str})
@@ -53,7 +53,9 @@ class TestLaunchSystem(CudaAsyncTestCase):
                 msg=f"Interactive Test failed: Prompt: {p['content']}, Expected '{answer}', got '{output_str}'",
             )
 
-        await client.chat.completions.create(messages=[], extra_body={"sesion_id": uuid_val})  # release session
+        await client.chat.completions.create(
+            model="ALLOYLM", messages=[], extra_body={"session_id": uuid_val}
+        )  # release session
         await client.close()
 
     async def try_forward_complete(self, port=8000):

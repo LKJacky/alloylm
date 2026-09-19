@@ -8,8 +8,7 @@ import ray
 from pydantic import BaseModel as PydanticBaseModel
 from torch import distributed as dist
 
-from alloylm.utils import get_free_port, init_ray
-from alloylm.utils import get_logger
+from alloylm.utils import get_free_port, get_logger, init_ray
 
 
 async def run_by_func_name(self, method, args, kwargs):
