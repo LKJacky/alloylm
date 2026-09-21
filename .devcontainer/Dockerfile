@@ -40,7 +40,7 @@ RUN python3 -m venv --system-site-packages /workspaces/.venv \
 # Install Node.js and AI tools.
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm install --global @github/copilot @anthropic-ai/claude-code @openai/codex \
+    && npm install --global @github/copilot @anthropic-ai/claude-code @openai/codex @deepseek-ai/dsh \
     && rm -rf /var/lib/apt/lists/*
 RUN /workspaces/.venv/bin/pip install --no-cache-dir \
     "hermes-node @ git+https://github.com/LKJacky/hermes_nodes.git#subdirectory=node"
