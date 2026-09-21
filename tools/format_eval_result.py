@@ -25,7 +25,11 @@ def main():
             data = json.load(f)
         data = {k: v for k, v in data.items() if k.startswith(args.prefix)}
         for item in data.values():
-            item["overlong_ratio"] = item["num_overlong"] / item["result_num"]
+            if item["result_num"] > 0:
+                item["overlong_ratio"] = item["num_overlong"] / item["result_num"]
+            else:
+                item["overlong_ratio"] = -1
+
         df = pd.concat([df, pd.DataFrame(data).T])
 
         total_samples = sum(item["result_num"] for item in data.values())
