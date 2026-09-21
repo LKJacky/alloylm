@@ -3,15 +3,42 @@
 
 Usage:
     python tools/jsonl_viewer.py work_dirs/debug/gsm8k_test.jsonl
-    python tools/jsonl_viewer.py a.jsonl b.jsonl   # tabs for each file
+    python tools/jsonl_viewer.py work_dirs/debug   # all JSONL files recursively
+    python tools/jsonl_viewer.py a.jsonl results/  # files and folders can be mixed
     python tools/jsonl_viewer.py --plain a.jsonl   # print to stdout, no UI
     python tools/jsonl_viewer.py --port 9000 --host 0.0.0.0 a.jsonl
 """
 
 import argparse
+import os
 import sys
+from functools import lru_cache
+from pathlib import Path
 
 from alloylm.utils import load_jsonl
+
+
+def resolve_jsonl_files(inputs: list[str]) -> list[str]:
+    """Expand input files and directories into a stable, deduplicated file
+    list."""
+    files: list[Path] = []
+    for value in inputs:
+        path = Path(value).expanduser()
+        if path.is_dir():
+            files.extend(sorted(candidate for candidate in path.rglob("*.jsonl") if candidate.is_file()))
+        elif path.is_file():
+            files.append(path)
+        else:
+            raise ValueError(f"input does not exist: {value}")
+
+    return list(dict.fromkeys(str(path.resolve()) for path in files))
+
+
+def display_paths(files: list[str]) -> list[str]:
+    """Return compact paths relative to the files' common directory."""
+    common_path = Path(os.path.commonpath(files))
+    root = common_path.parent if len(files) == 1 else common_path
+    return [os.path.relpath(file, start=root) for file in files]
 
 
 def record_search_text(record: dict) -> str:
@@ -32,8 +59,8 @@ def record_search_text(record: dict) -> str:
 
 def print_plain(files: list[str]) -> None:
     """Non-interactive fallback: pretty-print every record to stdout."""
-    for path in files:
-        print(f"===== {path} =====")
+    for path, name in zip(files, display_paths(files)):
+        print(f"===== {name} =====")
         for index, record in enumerate(load_jsonl(path)):
             metric = record.get("metric", "-")
             finish_reason = record.get("finish_reason") or "-"
@@ -66,51 +93,57 @@ INDEX_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>jsonl viewer</title>
 <style>
-:root{color-scheme:dark;--bg:#10141a;--panel:#171c24;--border:#27303c;--fg:#d7dee8;--dim:#8793a3;--ok:#3fb27f;--bad:#e05561;--accent:#4da3ff;--reason:#9fb3c8;--tool:#e8c35c}
+:root{color-scheme:light;--bg:#fff;--panel:#f6f8fa;--border:#d0d7de;--fg:#1f2328;--dim:#636c76;--ok:#1a7f37;--bad:#cf222e;--accent:#0969da;--reason:#57606a;--tool:#9a6700}
 *{box-sizing:border-box}
 body{margin:0;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column}
-header{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--border);flex-wrap:wrap}
-#tabs{display:flex;gap:6px;flex-wrap:wrap}
-.tab{padding:4px 12px;cursor:pointer;border:1px solid var(--border);border-radius:6px;color:var(--dim);white-space:nowrap}
-.tab.active{color:var(--fg);background:var(--panel);border-color:var(--accent)}
-#search{flex:1;min-width:180px;background:var(--panel);border:1px solid var(--border);color:var(--fg);padding:5px 10px;border-radius:6px;outline:none}
-#search:focus{border-color:var(--accent)}
-#matchinfo{color:var(--dim)}
-main{flex:1;display:flex;overflow:hidden}
-#list{width:44%;min-width:320px;overflow-y:auto;border-right:1px solid var(--border)}
-#detail{flex:1;overflow-y:auto;padding:14px 18px}
+header{display:flex;align-items:center;gap:12px;padding:9px 12px;border-bottom:1px solid var(--border);background:var(--panel)}
+header strong{white-space:nowrap}
+#search{flex:1;min-width:180px;background:var(--bg);border:1px solid var(--border);color:var(--fg);padding:6px 10px;border-radius:6px;outline:none}
+#search:focus{border-color:var(--accent);box-shadow:0 0 0 2px #ddf4ff}
+#matchinfo{color:var(--dim);white-space:nowrap}
+main{flex:1;display:grid;grid-template-columns:minmax(210px,22vw) minmax(430px,38vw) minmax(480px,1fr);min-width:1120px;overflow:hidden}
+.panel{min-width:0;overflow-y:auto;border-right:1px solid var(--border)}
+.panel-title{position:sticky;top:0;z-index:2;margin:0;padding:8px 10px;border-bottom:1px solid var(--border);background:var(--panel);font:600 12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
+#tabs{padding:6px}
+.tab{display:block;padding:7px 9px;cursor:pointer;border-radius:6px;color:var(--dim);overflow-wrap:anywhere}
+.tab:hover{background:#f0f3f6;color:var(--fg)}
+.tab.active{color:var(--fg);background:#ddf4ff;box-shadow:inset 3px 0 var(--accent)}
+#list{overflow:auto}
+#detail-panel{overflow-y:auto;border-right:0}
+#detail{padding:14px 18px}
 table{width:100%;border-collapse:collapse}
-thead th{position:sticky;top:0;background:var(--bg);text-align:left;color:var(--dim);font-weight:600;padding:5px 8px;border-bottom:1px solid var(--border);z-index:1}
-tbody td{padding:4px 8px;border-bottom:1px solid #1a2129;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:430px}
+thead th{position:sticky;top:31px;background:var(--bg);text-align:left;color:var(--dim);font-weight:600;padding:5px 8px;border-bottom:1px solid var(--border);z-index:1}
+tbody td{padding:5px 8px;border-bottom:1px solid #eaeef2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:430px}
 tbody tr{cursor:pointer}
-tbody tr:hover{background:#171e27}
-tbody tr.sel{background:#1d2a3a}
+tbody tr:hover{background:#f6f8fa}
+tbody tr.sel{background:#ddf4ff}
 .metric{font-weight:700}.ok{color:var(--ok)}.bad{color:var(--bad)}.none{color:var(--dim)}
 .meta{color:var(--dim);margin-bottom:14px}
 .meta b{color:var(--fg)}
 .msg{max-width:95%;margin:10px 0 18px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--panel)}
-.msg.system{border-color:#31577c;background:#14202d}.msg.user{border-color:#315f3d;background:#15241a}.msg.assistant{border-color:#66582e;background:#242116}.msg.tool{border-color:#593f70;background:#21192a}
+.msg.system{border-color:#b6d7f2;background:#f1f8ff}.msg.user{border-color:#b7dfbd;background:#f2fbf3}.msg.assistant{border-color:#e5cf86;background:#fffbea}.msg.tool{border-color:#d8c2eb;background:#fbf7ff}
 .role{font-weight:700}
-.role.system{color:#6db5ff}.role.user{color:#59c96e}.role.assistant{color:var(--tool)}.role.tool{color:#c78bff}
+.role.system{color:#0969da}.role.user{color:#1a7f37}.role.assistant{color:var(--tool)}.role.tool{color:#8250df}
 .callid{color:var(--dim);font-weight:400}
 pre{white-space:pre-wrap;word-break:break-word;margin:6px 0}
-.reasoning{background:#131a22;border:1px solid #1e2833;border-radius:6px;padding:6px 10px;margin:6px 0}
+.reasoning{background:#fff;border:1px solid #d8dee4;border-radius:6px;padding:6px 10px;margin:6px 0}
 .rlbl{color:var(--reason);font-weight:700;margin-bottom:2px}
 pre.toolcall{color:var(--tool)}
 .others{color:var(--dim);margin-top:10px}
 button.showall{background:none;border:none;color:var(--accent);cursor:pointer;font:inherit;padding:0}
-#footer{padding:6px 12px;border-top:1px solid var(--border);color:var(--dim)}
+#footer{padding:6px 12px;border-top:1px solid var(--border);color:var(--dim);background:var(--panel)}
 </style>
 </head>
 <body>
 <header>
-  <div id="tabs"></div>
-  <input id="search" placeholder="search  (id / messages / reasoning / tool calls / others)   Enter: first match   n/N: next/prev" spellcheck="false">
+  <strong>JSONL viewer</strong>
+  <input id="search" placeholder="search selected file  (id / messages / reasoning / tool calls / others)" spellcheck="false">
   <span id="matchinfo"></span>
 </header>
 <main>
-  <div id="list"><table><thead><tr><th>#</th><th>metric</th><th>finish</th><th>tokens</th><th>steps</th><th>id</th></tr></thead><tbody id="rows"></tbody></table></div>
-  <div id="detail"><div class="meta">Select a record.</div></div>
+  <aside id="files" class="panel"><h2 class="panel-title">Files</h2><div id="tabs"></div></aside>
+  <section id="list" class="panel"><h2 class="panel-title">Items</h2><table><thead><tr><th>#</th><th>metric</th><th>finish</th><th>tokens</th><th>steps</th><th>id</th></tr></thead><tbody id="rows"></tbody></table></section>
+  <section id="detail-panel" class="panel"><h2 class="panel-title">Content</h2><div id="detail"><div class="meta">Select a record.</div></div></section>
 </main>
 <div id="footer">j/k or &#8593;/&#8595; move &middot; Enter open &middot; g/G top/bottom &middot; / focus search &middot; n/N matches &middot; click row to inspect</div>
 <script>
@@ -125,8 +158,10 @@ function escTrunc(s, limit = 4000) {
   s = String(s);
   if (s.length <= limit) return esc(s);
   const id = 'ft' + fullTexts.size;
+  const headLength = Math.ceil(limit / 2);
+  const tailLength = Math.floor(limit / 2);
   fullTexts.set(id, s);
-  return `<span class="truncated">${esc(s.slice(0, limit))} &#8230; <button class="showall" data-id="${id}">show all (${s.length} chars)</button></span>`;
+  return `<span class="truncated">${esc(s.slice(0, headLength))}\n&#8230; <button class="showall" data-id="${id}">show all (${s.length} chars)</button> &#8230;\n${esc(s.slice(-tailLength))}</span>`;
 }
 
 async function api(path) {
@@ -143,7 +178,7 @@ async function loadFiles() {
 
 function renderTabs() {
   tabsEl.innerHTML = files.map((f, i) =>
-    `<span class="tab${i === fileIdx ? ' active' : ''}" data-i="${i}">${esc(f.name)} <span style="opacity:.6">(${f.count})</span></span>`
+    `<span class="tab${i === fileIdx ? ' active' : ''}" data-i="${i}" title="${esc(f.name)}">${esc(f.name)} <span style="opacity:.6">(${f.count})</span></span>`
   ).join('');
 }
 
@@ -193,7 +228,7 @@ function renderDetail(rec) {
     }
   }
   detailEl.innerHTML = html;
-  detailEl.scrollTop = 0;
+  detailEl.parentElement.scrollTop = 0;
 }
 
 function msgHtml(m) {
@@ -278,14 +313,15 @@ def run_web(files: list[str], host: str, port: int) -> None:
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import HTMLResponse
 
-    records = [load_jsonl(f) for f in files]
-    search_cache: dict[int, list[str | None]] = {}
+    file_names = display_paths(files)
+    counts = []
+    for path in files:
+        with open(path, "rb") as file:
+            counts.append(sum(bool(line.strip()) for line in file))
 
-    def search_text(file_idx: int, idx: int) -> str:
-        cache = search_cache.setdefault(file_idx, [None] * len(records[file_idx]))
-        if cache[idx] is None:
-            cache[idx] = record_search_text(records[file_idx][idx]).lower()
-        return cache[idx]
+    @lru_cache(maxsize=2)
+    def get_records(file_idx: int) -> list[dict]:
+        return load_jsonl(files[file_idx])
 
     app = FastAPI()
 
@@ -295,12 +331,13 @@ def run_web(files: list[str], host: str, port: int) -> None:
 
     @app.get("/api/files")
     def api_files():
-        return [{"name": f, "count": len(recs)} for f, recs in zip(files, records)]
+        return [{"name": name, "count": count} for name, count in zip(file_names, counts)]
 
     @app.get("/api/list/{file_idx}")
     def api_list(file_idx: int):
-        if not 0 <= file_idx < len(records):
+        if not 0 <= file_idx < len(files):
             raise HTTPException(status_code=404, detail="file index out of range")
+        records = get_records(file_idx)
         return [
             {
                 "idx": i,
@@ -311,23 +348,26 @@ def run_web(files: list[str], host: str, port: int) -> None:
                 "output_tokens": rec.get("output_tokens"),
                 "num_steps": sum(msg.get("role") == "assistant" for msg in rec.get("messages") or []),
             }
-            for i, rec in enumerate(records[file_idx])
+            for i, rec in enumerate(records)
         ]
 
     @app.get("/api/record/{file_idx}/{idx}")
     def api_record(file_idx: int, idx: int):
-        if not 0 <= file_idx < len(records) or not 0 <= idx < len(records[file_idx]):
+        if not 0 <= file_idx < len(files):
+            raise HTTPException(status_code=404, detail="file index out of range")
+        records = get_records(file_idx)
+        if not 0 <= idx < len(records):
             raise HTTPException(status_code=404, detail="record index out of range")
-        return records[file_idx][idx]
+        return records[idx]
 
     @app.get("/api/search/{file_idx}")
     def api_search(file_idx: int, q: str = ""):
-        if not 0 <= file_idx < len(records):
+        if not 0 <= file_idx < len(files):
             raise HTTPException(status_code=404, detail="file index out of range")
         query = q.lower()
         if not query:
             return []
-        return [i for i in range(len(records[file_idx])) if query in search_text(file_idx, i)]
+        return [i for i, record in enumerate(get_records(file_idx)) if query in record_search_text(record).lower()]
 
     url = f"http://{host}:{port}"
     print(f"jsonl_viewer: serving {len(files)} file(s) at {url}")
@@ -340,17 +380,24 @@ def run_web(files: list[str], host: str, port: int) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("files", nargs="+", help="JSONL file(s) to view")
+    parser.add_argument("inputs", nargs="+", help="JSONL file(s) or directories to view")
     parser.add_argument("--plain", action="store_true", help="print records to stdout instead of launching a UI")
     parser.add_argument("--host", default="127.0.0.1", help="web UI bind address (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765, help="web UI port (default 8765)")
     args = parser.parse_args()
 
+    try:
+        files = resolve_jsonl_files(args.inputs)
+    except ValueError as error:
+        parser.error(str(error))
+    if not files:
+        parser.error("no JSONL files found in the provided inputs")
+
     if args.plain:
-        print_plain(args.files)
+        print_plain(files)
         return 0
 
-    run_web(args.files, args.host, args.port)
+    run_web(files, args.host, args.port)
     return 0
 
 
