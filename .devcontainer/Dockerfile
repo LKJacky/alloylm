@@ -33,17 +33,33 @@ RUN apt-get update \
     zip \
     && rm -rf /var/lib/apt/lists/*
 
-# Create the Python environment.
-RUN python3 -m venv --system-site-packages /workspaces/.venv \
-    && /workspaces/.venv/bin/python -m pip install --no-cache-dir --upgrade pip
 
-# Install Node.js and AI tools.
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && npm install --global @github/copilot @anthropic-ai/claude-code @openai/codex @deepseek-ai/dsh \
-    && rm -rf /var/lib/apt/lists/*
-RUN /workspaces/.venv/bin/pip install --no-cache-dir \
+# Create a script file sourced by both interactive and non-interactive bash shells
+ENV BASH_ENV="/root/.bash_env"
+RUN touch "${BASH_ENV}"
+RUN echo '. "${BASH_ENV}"' >> ~/.bashrc
+
+# Download and install nvm
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | PROFILE="${BASH_ENV}" bash
+RUN echo node > .nvmrc
+RUN nvm install
+
+# Install AI tools.
+RUN npm install --global \
+    @github/copilot \
+    @anthropic-ai/claude-code \
+    @openai/codex \
+    @deepseek-ai/dsh
+
+# Install uv and create the Python environment.
+RUN curl -LsSf https://astral.sh/uv/install.sh \
+    | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv venv --system-site-packages /workspaces/.venv
+
+RUN uv pip install --python /workspaces/.venv/bin/python \
     "hermes-node @ git+https://github.com/LKJacky/hermes_nodes.git#subdirectory=node"
+
 # Install Python dependencies.
 COPY requirements.txt /root/requirements.txt
-RUN /workspaces/.venv/bin/pip install --no-cache-dir -r /root/requirements.txt
+RUN uv pip install --python /workspaces/.venv/bin/python \
+    --requirements /root/requirements.txt
