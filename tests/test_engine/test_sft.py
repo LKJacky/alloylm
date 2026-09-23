@@ -222,6 +222,25 @@ class ChunkCrossEntropyLossTest(unittest.TestCase):
         self.assertTrue(torch.allclose(chunked_hidden_grad, hidden.grad, atol=1e-6))
         self.assertTrue(torch.allclose(chunked_weight_grad, weight.grad, atol=1e-6))
 
+    def test_empty_labels_produce_graph_connected_zero_loss(self):
+        hidden = torch.randn(1, 0, 5, requires_grad=True)
+        weight = torch.randn(11, 5, requires_grad=True)
+        labels = torch.empty((1, 0), dtype=torch.long)
+
+        loss = ChunkLoss.apply(
+            hidden,
+            weight,
+            default_sft_loss_func,
+            [{"labels": labels, "loss_weight": 0.25}],
+            512,
+            False,
+        )
+        loss.backward()
+
+        self.assertEqual(loss.item(), 0.0)
+        self.assertTrue(torch.equal(hidden.grad, torch.zeros_like(hidden)))
+        self.assertTrue(torch.equal(weight.grad, torch.zeros_like(weight)))
+
 
 # ---------------------------------------------------------------------------
 # End-to-end SFT training (real model + tokenizer + TrainEngine on GPU)

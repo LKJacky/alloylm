@@ -126,6 +126,8 @@ def default_loss_func(
 
 
 def default_sft_loss_func(logits: torch.Tensor, labels: torch.Tensor, loss_weight: float):
+    if labels.numel() == 0:
+        return logits.sum() * 0.0
     return F.cross_entropy(logits.flatten(0, 1), labels.flatten(), reduction="sum") * loss_weight
 
 
@@ -454,8 +456,6 @@ class TrainEngine:
             position_ids = packed_batch["position_ids"].cuda()
 
             mask = shift_labels[0] >= 0
-            if not mask.any():
-                continue
 
             def _chunk_loss(hidden_states, _shift_labels=shift_labels, _mask=mask):
                 hidden_states = hidden_states[:, : _shift_labels.size(1)]

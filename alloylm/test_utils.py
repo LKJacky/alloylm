@@ -136,6 +136,7 @@ def check_cuda_leak():
         raise RuntimeError(f"GPU memory leak detected: {used_memory:.2f} GB used after cleanup attempts.")
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
 @unittest.skipIf(torch.cuda.memory_allocated() / (1024 * 1024 * 1024) > 0.1, "GPU memory is not clean before test")
 class CudaAsyncTestCase(IsolatedAsyncioTestCase):
     @classmethod
