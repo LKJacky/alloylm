@@ -70,6 +70,8 @@ class OneStepTask(Task):
             raise RuntimeError(
                 f"Inference timeout {task_data.infer_args.sample_args.get('timeout', 'unknow')} seconds"
             ) from e
+        except Exception as e:
+            raise RuntimeError(f"Inference failed: {e}") from e
         finally:
             await client.close()
         return task_data
