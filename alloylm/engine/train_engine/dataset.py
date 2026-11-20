@@ -17,7 +17,7 @@ from .utils import pad_and_split_for_sp
 
 
 def remove_common(a: str, b: str):
-    i = min(len(a), len(b))
+    i = 0
     while i < len(a) and i < len(b):
         if a[i] != b[i]:
             break
@@ -40,22 +40,19 @@ def distangle_train_or_not_train(messages: list[dict], chat_template, tools):
             text = render(
                 messages=messages[:i], add_generation_prompt=True, tools=tools, enable_thinking=enable_thinking
             )
-            if not text.startswith(pre_text):
-                dis_a, dis_b = remove_common(text, pre_text)
-                get_logger().critical(f"not match prefix \n{dis_a}\n{dis_b}")
-                return converted_messages
+            assert text.startswith(pre_text), (
+                f"not match prefix p1 \n{'\n-------------------------------\n'.join(remove_common(text, pre_text))}"
+            )
 
             converted_messages.append((text[len(pre_text) :], False))  # Append only the new part of the text
             pre_text = text
 
             text = render(
-                messages=messages[:i], add_generation_prompt=True, tools=tools, enable_thinking=enable_thinking
+                messages=messages[: i + 1], add_generation_prompt=False, tools=tools, enable_thinking=enable_thinking
             )
-            if not text.startswith(pre_text):
-                dis_a, dis_b = remove_common(text, pre_text)
-                get_logger().critical(f"not match prefix \n{dis_a}\n{dis_b}")
-                return converted_messages
-            assert text.startswith(pre_text), f"not match prefix {remove_common(text, pre_text)}"
+            assert text.startswith(pre_text), (
+                f"not match prefix p2 \n{'\n-------------------------------\n'.join(remove_common(text, pre_text))}"
+            )
             converted_messages.append((text[len(pre_text) :], True))  # Append only the new part of the text
             pre_text = text
 
