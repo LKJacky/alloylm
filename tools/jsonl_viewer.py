@@ -12,10 +12,11 @@ Usage:
 import argparse
 import os
 import sys
-from functools import lru_cache
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
-from alloylm.utils import load_jsonl
+import orjson
 
 
 def resolve_jsonl_files(inputs: list[str]) -> list[str]:
@@ -61,30 +62,132 @@ def print_plain(files: list[str]) -> None:
     """Non-interactive fallback: pretty-print every record to stdout."""
     for path, name in zip(files, display_paths(files)):
         print(f"===== {name} =====")
-        for index, record in enumerate(load_jsonl(path)):
-            metric = record.get("metric", "-")
-            finish_reason = record.get("finish_reason") or "-"
-            tokens = " / ".join(str(record.get(k, "-")) for k in ("input_tokens", "output_tokens", "total_tokens"))
-            print(
-                f"[{index}] id: {record.get('id', '?')}  metric: {metric}  finish_reason: {finish_reason}  tokens: {tokens}"
-            )
-            for msg in record.get("messages") or []:
-                header = f"  ### {msg.get('role', '?')}"
-                call_id = msg.get("tool_call_id")
-                if call_id is not None:
-                    header += f" (call {call_id})"
-                print(header)
-                reasoning = msg.get("reasoning_content")
-                if msg.get("role") == "assistant" and reasoning:
-                    print(f"  reasoning:\n{reasoning}")
-                print(msg.get("content") or "")
-                if msg.get("role") != "assistant" and reasoning:
-                    print(f"  reasoning:\n{reasoning}")
-                for call in msg.get("tool_calls") or []:
-                    fn = call.get("function") or call
-                    print(f"  - {fn.get('name', '?')} {fn.get('arguments') or ''}")
-            print()
+        with open(path, "rb") as handle:
+            index = -1
+            for line in handle:
+                if not line.strip():
+                    continue
+                index += 1
+                record = orjson.loads(line)
+                metric = record.get("metric", "-")
+                finish_reason = record.get("finish_reason") or "-"
+                tokens = " / ".join(str(record.get(key, "-")) for key in ("input_tokens", "output_tokens", "total_tokens"))
+                print(
+                    f"[{index}] id: {record.get('id', '?')}  metric: {metric}  finish_reason: {finish_reason}  tokens: {tokens}"
+                )
+                for msg in record.get("messages") or []:
+                    header = f"  ### {msg.get('role', '?')}"
+                    call_id = msg.get("tool_call_id")
+                    if call_id is not None:
+                        header += f" (call {call_id})"
+                    print(header)
+                    reasoning = msg.get("reasoning_content")
+                    if msg.get("role") == "assistant" and reasoning:
+                        print(f"  reasoning:\n{reasoning}")
+                    print(msg.get("content") or "")
+                    if msg.get("role") != "assistant" and reasoning:
+                        print(f"  reasoning:\n{reasoning}")
+                    for call in msg.get("tool_calls") or []:
+                        fn = call.get("function") or call
+                        print(f"  - {fn.get('name', '?')} {fn.get('arguments') or ''}")
+                print()
 
+
+PAGE_SIZE = 100
+
+class JsonlStore:
+    """One jsonl file: byte offsets now, parsed records on demand.
+
+    ``ensure(n)`` walks the file until n offsets are known, so the first page
+    costs a few hundred KB no matter how large the file is.  Offsets are kept
+    for the whole session; a record's body is parsed only when it is opened and
+    a handful of recent ones are cached for back-and-forth navigation.
+    """
+
+    def __init__(self, path: str, cache_size: int = 32) -> None:
+        self.path = path
+        self._handle = open(path, "rb")
+        self._lock = threading.Lock()
+        self._offsets: list[int] = []
+        self._eof = False
+        self._cache: OrderedDict[int, dict] = OrderedDict()
+        self._cache_size = cache_size
+
+    @property
+    def known(self) -> int:
+        return len(self._offsets)
+
+    @property
+    def complete(self) -> bool:
+        return self._eof
+
+    def ensure(self, count: int) -> None:
+        """Index at least ``count`` records (or reach the end of the file)."""
+        with self._lock:
+            while len(self._offsets) < count and not self._eof:
+                position = self._handle.tell()
+                line = self._handle.readline()
+                if not line:
+                    self._eof = True
+                    break
+                if line.strip():
+                    self._offsets.append(position)
+
+    def get(self, index: int) -> dict:
+        if index < 0:
+            raise IndexError(index)
+        self.ensure(index + 1)
+        if index >= len(self._offsets):
+            raise IndexError(index)
+        with self._lock:
+            cached = self._cache.get(index)
+            if cached is not None:
+                self._cache.move_to_end(index)
+                return cached
+            self._handle.seek(self._offsets[index])
+            line = self._handle.readline()
+        record = orjson.loads(line)
+        with self._lock:
+            self._cache[index] = record
+            if len(self._cache) > self._cache_size:
+                self._cache.popitem(last=False)
+        return record
+
+    def search(self, query: str, limit: int = 200) -> list[int]:
+        """Scan the file for a substring; stops after ``limit`` hits."""
+        hits: list[int] = []
+        index = -1
+        with open(self.path, "rb") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                index += 1
+                try:
+                    record = orjson.loads(line)
+                except orjson.JSONDecodeError:
+                    continue
+                if query in record_search_text(record).lower():
+                    hits.append(index)
+                    if len(hits) >= limit:
+                        break
+        return hits
+
+    def close(self) -> None:
+        self._handle.close()
+
+
+def record_summary(index: int, record: dict) -> dict:
+    """The few fields the list column needs; the body stays on disk."""
+    messages = record.get("messages") or []
+    return {
+        "idx": index,
+        "id": record.get("id", "?"),
+        "metric": record.get("metric", -1.0),
+        "finish_reason": str(record.get("finish_reason") or "-"),
+        "input_tokens": record.get("input_tokens"),
+        "output_tokens": record.get("output_tokens"),
+        "num_steps": sum(1 for message in messages if message.get("role") == "assistant"),
+    }
 
 INDEX_HTML = """<!doctype html>
 <html lang="en">
@@ -149,7 +252,9 @@ button.showall{background:none;border:none;color:var(--accent);cursor:pointer;fo
 <script>
 const $ = (s) => document.querySelector(s);
 const rowsEl = $('#rows'), detailEl = $('#detail'), searchEl = $('#search'), tabsEl = $('#tabs'), matchEl = $('#matchinfo');
-let files = [], fileIdx = 0, records = [], cursor = -1, matches = [], matchIdx = -1;
+let files = [], fileIdx = 0, loaded = [], known = 0, complete = false, loading = false,
+    cursor = -1, matches = [], matchIdx = -1;
+const PAGE = 100;
 let fullTexts = new Map();
 
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -177,16 +282,38 @@ async function loadFiles() {
 }
 
 function renderTabs() {
-  tabsEl.innerHTML = files.map((f, i) =>
-    `<span class="tab${i === fileIdx ? ' active' : ''}" data-i="${i}" title="${esc(f.name)}">${esc(f.name)} <span style="opacity:.6">(${f.count})</span></span>`
-  ).join('');
+  tabsEl.innerHTML = files.map((f, i) => {
+    const count = i === fileIdx ? (complete ? loaded.length : loaded.length + '+') : (f.total ?? '?');
+    return `<span class="tab${i === fileIdx ? ' active' : ''}" data-i="${i}" title="${esc(f.name)}">${esc(f.name)} <span style="opacity:.6">(${count})</span></span>`;
+  }).join('');
 }
 
 async function selectFile(i) {
   fileIdx = i; cursor = -1; matches = []; matchIdx = -1; matchEl.textContent = '';
-  records = await api(`/api/list/${i}`);
-  renderTabs(); renderList();
+  loaded = []; known = 0; complete = false; loading = false;
   detailEl.innerHTML = '<div class="meta">Select a record.</div>';
+  await loadMore();
+  renderTabs(); renderList();
+}
+
+async function loadMore() {
+  if (loading || complete) return;
+  loading = true;
+  const start = loaded.length;
+  try {
+    const page = await api(`/api/list/${fileIdx}?start=${start}&limit=${PAGE}`);
+    loaded = loaded.concat(page.items);
+    known = page.known;
+    complete = page.complete;
+  } finally {
+    loading = false;
+  }
+  renderTabs();
+  renderList();
+}
+
+async function ensureLoadedFor(i) {
+  while (!complete && loaded.length <= i) await loadMore();
 }
 
 function metricCell(m) {
@@ -196,15 +323,20 @@ function metricCell(m) {
 }
 
 function renderList() {
-  rowsEl.innerHTML = records.map((r) =>
+  const rows = loaded.map((r) =>
     `<tr data-i="${r.idx}" class="${r.idx === cursor ? 'sel' : ''}"><td>${r.idx}</td>${metricCell(r.metric)}<td>${esc(r.finish_reason)}</td><td>${r.input_tokens ?? '-'}/${r.output_tokens ?? '-'}</td><td>${r.num_steps}</td><td>${esc(r.id)}</td></tr>`
   ).join('');
+  const tail = complete ? '' : `<tr><td colspan="6" class="meta" id="loading-row">loading... ${loaded.length} loaded</td></tr>`;
+  rowsEl.innerHTML = rows + tail;
   const sel = rowsEl.querySelector('tr.sel');
   if (sel) sel.scrollIntoView({ block: 'nearest' });
 }
 
+
 async function openRecord(i) {
-  cursor = i; renderList();
+  cursor = i;
+  await ensureLoadedFor(i);
+  renderList();
   const rec = await api(`/api/record/${fileIdx}/${i}`);
   renderDetail(rec);
 }
@@ -257,6 +389,10 @@ rowsEl.addEventListener('click', (e) => {
   const tr = e.target.closest('tr');
   if (tr) openRecord(Number(tr.dataset.i));
 });
+$('#list').addEventListener('scroll', (event) => {
+  const el = event.currentTarget;
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 400) loadMore();
+});
 detailEl.addEventListener('click', (e) => {
   if (!e.target.classList.contains('showall')) return;
   const full = fullTexts.get(e.target.dataset.id);
@@ -289,11 +425,11 @@ document.addEventListener('keydown', (e) => {
     return;
   }
   if (e.key === '/') { e.preventDefault(); searchEl.focus(); }
-  else if (e.key === 'j' || e.key === 'ArrowDown') { e.preventDefault(); cursor = Math.min(cursor + 1, records.length - 1); renderList(); }
+  else if (e.key === 'j' || e.key === 'ArrowDown') { e.preventDefault(); cursor = Math.min(cursor + 1, loaded.length - 1); renderList(); }
   else if (e.key === 'k' || e.key === 'ArrowUp') { e.preventDefault(); cursor = Math.max(0, cursor - 1); renderList(); }
   else if (e.key === 'Enter') { if (cursor >= 0) openRecord(cursor); }
   else if (e.key === 'g') { cursor = 0; renderList(); }
-  else if (e.key === 'G') { cursor = records.length - 1; renderList(); }
+  else if (e.key === 'G') { cursor = loaded.length - 1; renderList(); }
   else if (e.key === 'n') { jumpMatch(1); }
   else if (e.key === 'N') { jumpMatch(-1); }
 });
@@ -306,7 +442,7 @@ loadFiles();
 
 
 def run_web(files: list[str], host: str, port: int) -> None:
-    """Serve a web UI for the given JSONL files on http://host:port."""
+    """Serve the lazily indexed files on http://host:port."""
     import webbrowser
 
     import uvicorn
@@ -314,14 +450,7 @@ def run_web(files: list[str], host: str, port: int) -> None:
     from fastapi.responses import HTMLResponse
 
     file_names = display_paths(files)
-    counts = []
-    for path in files:
-        with open(path, "rb") as file:
-            counts.append(sum(bool(line.strip()) for line in file))
-
-    @lru_cache(maxsize=2)
-    def get_records(file_idx: int) -> list[dict]:
-        return load_jsonl(files[file_idx])
+    stores = [JsonlStore(path) for path in files]
 
     app = FastAPI()
 
@@ -331,43 +460,44 @@ def run_web(files: list[str], host: str, port: int) -> None:
 
     @app.get("/api/files")
     def api_files():
-        return [{"name": name, "count": count} for name, count in zip(file_names, counts)]
+        return [
+            {"name": name, "total": store.known if store.complete else None}
+            for name, store in zip(file_names, stores)
+        ]
 
     @app.get("/api/list/{file_idx}")
-    def api_list(file_idx: int):
-        if not 0 <= file_idx < len(files):
+    def api_list(file_idx: int, start: int = 0, limit: int = PAGE_SIZE):
+        if not 0 <= file_idx < len(stores):
             raise HTTPException(status_code=404, detail="file index out of range")
-        records = get_records(file_idx)
-        return [
-            {
-                "idx": i,
-                "id": rec.get("id", "?"),
-                "metric": rec.get("metric", -1.0),
-                "finish_reason": str(rec.get("finish_reason") or "-"),
-                "input_tokens": rec.get("input_tokens"),
-                "output_tokens": rec.get("output_tokens"),
-                "num_steps": sum(msg.get("role") == "assistant" for msg in rec.get("messages") or []),
-            }
-            for i, rec in enumerate(records)
-        ]
+        store = stores[file_idx]
+        start = max(0, start)
+        limit = max(1, min(limit, 1000))
+        store.ensure(start + limit)
+        end = min(start + limit, store.known)
+        return {
+            "start": start,
+            "items": [record_summary(index, store.get(index)) for index in range(start, end)],
+            "known": store.known,
+            "complete": store.complete,
+        }
 
     @app.get("/api/record/{file_idx}/{idx}")
     def api_record(file_idx: int, idx: int):
-        if not 0 <= file_idx < len(files):
+        if not 0 <= file_idx < len(stores):
             raise HTTPException(status_code=404, detail="file index out of range")
-        records = get_records(file_idx)
-        if not 0 <= idx < len(records):
+        try:
+            return stores[file_idx].get(idx)
+        except IndexError:
             raise HTTPException(status_code=404, detail="record index out of range")
-        return records[idx]
 
     @app.get("/api/search/{file_idx}")
-    def api_search(file_idx: int, q: str = ""):
-        if not 0 <= file_idx < len(files):
+    def api_search(file_idx: int, q: str = "", limit: int = 200):
+        if not 0 <= file_idx < len(stores):
             raise HTTPException(status_code=404, detail="file index out of range")
         query = q.lower()
         if not query:
             return []
-        return [i for i, record in enumerate(get_records(file_idx)) if query in record_search_text(record).lower()]
+        return stores[file_idx].search(query, limit=limit)
 
     url = f"http://{host}:{port}"
     print(f"jsonl_viewer: serving {len(files)} file(s) at {url}")
