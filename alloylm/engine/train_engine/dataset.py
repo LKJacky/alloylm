@@ -11,30 +11,58 @@ from torch import distributed as dist
 from torch.utils.data import ConcatDataset, Dataset
 from transformers import AutoTokenizer
 
+from alloylm.utils import get_logger
+
 from .utils import pad_and_split_for_sp
 
 
-def distangle_train_or_not_train(messages: list[dict], chat_template):
+def remove_common(a: str, b: str):
+    i = min(len(a), len(b))
+    while i < len(a) and i < len(b):
+        if a[i] != b[i]:
+            break
+        else:
+            i += 1
+    i = max(0, i - 20)
+    return a[i:], b[i:]
+
+
+def distangle_train_or_not_train(messages: list[dict], chat_template, tools):
     # distinguish between has loss or not.
     converted_messages = []
     pre_text = ""
     render = chat_template.render if hasattr(chat_template, "render") else chat_template
+
     for i, message in enumerate(messages):
-        if i + 1 < len(messages) and messages[i + 1]["role"] == "assistant":
-            add_generation_prompt = True
-        else:
-            add_generation_prompt = False
-        text = render(messages=messages[: i + 1], add_generation_prompt=add_generation_prompt)
         if message["role"] == "assistant":
-            has_loss = True
-        else:
-            has_loss = False
-        converted_messages.append((text[len(pre_text) :], has_loss))  # Append only the new part of the text
-        pre_text = text
+            assert i > 0
+            enable_thinking = bool(message.get("reasoning_content"))
+            text = render(
+                messages=messages[:i], add_generation_prompt=True, tools=tools, enable_thinking=enable_thinking
+            )
+            if not text.startswith(pre_text):
+                dis_a, dis_b = remove_common(text, pre_text)
+                get_logger().critical(f"not match prefix \n{dis_a}\n{dis_b}")
+                return converted_messages
+
+            converted_messages.append((text[len(pre_text) :], False))  # Append only the new part of the text
+            pre_text = text
+
+            text = render(
+                messages=messages[:i], add_generation_prompt=True, tools=tools, enable_thinking=enable_thinking
+            )
+            if not text.startswith(pre_text):
+                dis_a, dis_b = remove_common(text, pre_text)
+                get_logger().critical(f"not match prefix \n{dis_a}\n{dis_b}")
+                return converted_messages
+            assert text.startswith(pre_text), f"not match prefix {remove_common(text, pre_text)}"
+            converted_messages.append((text[len(pre_text) :], True))  # Append only the new part of the text
+            pre_text = text
+
     return converted_messages
 
 
-def tokenize_messages(messages, chat_template, tokenizer):
+def tokenize_messages(messages, chat_template, tokenizer, tools):
 
     def tokenize(converted_messages: list[(str, bool)], tokenizer):
         input_ids = []
@@ -48,7 +76,7 @@ def tokenize_messages(messages, chat_template, tokenizer):
                 labels.extend([-100] * len(tokenized))  # Mask out tokens that don't contribute to loss
         return input_ids, labels
 
-    converted_messages = distangle_train_or_not_train(messages, chat_template)
+    converted_messages = distangle_train_or_not_train(messages, chat_template, tools=tools)
     return tokenize(converted_messages, tokenizer)
 
 
@@ -277,7 +305,9 @@ class SFTDataset(Dataset):
             file_handle.seek(offset)
             line = file_handle.readline()
             data = json.loads(line)
-            input_id, label = tokenize_messages(data["messages"], self.chat_template, self.tokenizer)
+            input_id, label = tokenize_messages(
+                data["messages"], self.chat_template, self.tokenizer, tools=data.get("tools", None)
+            )
             input_ids.extend(input_id)
             labels.extend(label)
             seq_lens.append(len(input_id))

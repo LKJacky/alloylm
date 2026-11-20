@@ -185,8 +185,10 @@ class SFTPackDataset(Dataset):
                     previous_file_index = file_index
                 file_handle.seek(offset)
                 line = file_handle.readline()
-                messages = orjson.loads(line)["messages"]
-                num_tokens = len(tokenize_messages(messages, chat_template, tokenizer)[0])
+                data = orjson.loads(line)
+                messages = data["messages"]
+                tools = data.get("tools", None)
+                num_tokens = len(tokenize_messages(messages, chat_template, tokenizer, tools=tools)[0])
                 results.append((file_index, offset, num_tokens))
                 if bar:
                     bar.update(1)
@@ -200,9 +202,12 @@ class SFTPackDataset(Dataset):
         with open(self.file_paths[file_index], "rb") as f:
             f.seek(offset)
             line = f.readline()
-        messages = orjson.loads(line)["messages"]
+        data = orjson.loads(line)
+        messages = data["messages"]
         content = ""
-        for item, compute_loss in distangle_train_or_not_train(messages, self.chat_template):
+        for item, compute_loss in distangle_train_or_not_train(
+            messages, self.chat_template, tools=data.get("tools", None)
+        ):
             if compute_loss:
                 content += f"<loss>{item}</loss>"
             else:
