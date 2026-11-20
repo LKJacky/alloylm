@@ -16,11 +16,48 @@ from alloylm.utils import get_logger
 DEFAULT_MODEL_NAME = "ALLOYLM"
 
 
-def load_jsonl(path: str) -> list[dict]:
-    data = []
+def load_jsonl_ids(path: str) -> set[str]:
+    """The ids of a jsonl file, one line at a time.
+
+    A resume only needs to know which samples are done; reading them into a list of
+    dicts first held the whole 20 GB file in memory for no reason.
+    """
+    ids: set[str] = set()
+    torn = 0
     with open(path, encoding="utf-8") as f:
         for line in f:
-            data.append(json.loads(line))
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ids.add(json.loads(line)["id"])
+            except (json.JSONDecodeError, KeyError):
+                torn += 1
+    if torn:
+        print(f"[load_jsonl_ids] {path}: skipped {torn} truncated line(s)")
+    return ids
+
+
+def load_jsonl(path: str) -> list[dict]:
+    """Every complete line of a jsonl file; a killed run can leave one truncated line.
+
+    A single half-written record used to abort the whole resume with
+    ``JSONDecodeError: Unterminated string``, so a torn tail is skipped and counted
+    instead: the missing id is simply re-run.
+    """
+    data = []
+    torn = 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data.append(json.loads(line))
+            except json.JSONDecodeError:
+                torn += 1
+    if torn:
+        print(f"[load_jsonl] {path}: skipped {torn} truncated line(s)")
     return data
 
 
@@ -172,9 +209,12 @@ class EvalRunner:
         for dataset in self.datasets:
             resume_path = os.path.join(self.work_dir, f"{dataset.config.name}.jsonl")
             if os.path.exists(resume_path):
-                data = load_jsonl(resume_path)
-                resumed[dataset.config.name] = {d["id"]: TaskData(**d) for d in data}
+                # Ids only, streamed: materialising the records first cost ~40 GB at 94k lines.
+                resumed[dataset.config.name] = load_jsonl_ids(resume_path)
                 self.logger.info(f"Resuming from {resume_path} with {len(resumed[dataset.config.name])} items")
+        # Samples skipped by resume never reach ds_results, so the end-of-run
+        # "failed" count has to subtract them or it reports every finished id.
+        self._resumed_counts = {name: len(ids) for name, ids in resumed.items()}
         return resumed
 
     async def run(self, semaphore):
@@ -204,9 +244,7 @@ class EvalRunner:
                 ds_resumed = resumed.get(dataset.config.name, {})
                 for item in dataset:
                     if item.task_data.id in ds_resumed:
-                        task_data = ds_resumed[item.task_data.id]
-                        task_data.infer_args = item.task_data.infer_args
-                        future = asyncio.create_task(directly_return(task_data))
+                        future = asyncio.create_task(directly_return(None))
                         future._resumed = True
                     else:
                         future = asyncio.create_task(self._run_eval_item(item))
@@ -217,7 +255,18 @@ class EvalRunner:
         async def consume_func(future):
             ds_name = future._dataset_name
             result = future.result()
-            ds_results[ds_name].append(result)
+            if result is not None:
+                # Keep only what the summary reads (metric, token counts, turn count,
+                # finish_reason); the transcript itself is already on disk.
+                ds_results[ds_name].append(
+                    result.model_copy(
+                        update={
+                            "messages": [{}] * len(result.messages),
+                            "tools": None,
+                            "others": {},
+                        }
+                    )
+                )
             if result and not future._resumed:
                 await save_queues[ds_name].put(result)
             tqdm_bars[ds_name].update(1)
@@ -231,8 +280,13 @@ class EvalRunner:
                 name = dataset.config.name
                 origin_num = len(dataset)
                 valid = [r for r in ds_results[name] if r is not None]
-                if len(valid) < origin_num:
-                    self.logger.info(f"Warning: {origin_num - len(valid)} samples failed during evaluation of {name}.")
+                resumed_num = getattr(self, "_resumed_counts", {}).get(name, 0)
+                failed_num = origin_num - len(valid) - resumed_num
+                if failed_num > 0:
+                    self.logger.info(
+                        f"Warning: {failed_num} samples failed during evaluation of {name} "
+                        f"({resumed_num} skipped as already done, {len(valid)} fresh results)."
+                    )
                 summary = dataset.summary(valid)
                 results.append(summary)
                 self.logger.info(f"Dataset {name} eval done, main metric: {summary.metric:.4f}")
