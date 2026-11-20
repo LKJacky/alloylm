@@ -66,6 +66,22 @@ from .moe_layer import Qwen3MoeSparseMoeBlock
 from .swa_cache import AttentionArgs, InferKernel, SwaCacheManager
 
 
+def freeze_module_params_(module: nn.Module) -> int:
+    """Freeze every parameter of ``module`` and return how many elements were
+    frozen.
+
+    Call this *before* ``fully_shard``: FSDP decides whether a parameter needs a
+    gradient shard from ``requires_grad`` at wrap time.  ``module.eval()`` is not
+    enough (it only flips ``training``) and the next ``model.train()`` undoes it.
+    """
+    frozen = 0
+    for param in module.parameters():
+        param.requires_grad_(False)
+        param.grad = None
+        frozen += param.numel()
+    return frozen
+
+
 def all_to_all(
     input: torch.Tensor, scatter_dim: int, gather_dim: int, mesh: DeviceMesh, training=True
 ) -> torch.Tensor:
@@ -778,6 +794,7 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
         *model_args,
         fsdp_config: FSDPConfig = DEFAULT_FSDP_CONFIG,
         window_size=-1,
+        freeze_mlp: bool = False,
         **kwargs,
     ) -> "FSDPQwen2ForCausalLM":
         class HFCheckpointLoaderWithMapping(HFCheckpointLoader):
@@ -866,8 +883,11 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
         model.model.rotary_emb = Qwen2RotaryEmbedding(config)
         num_recompute_layers = int(config.num_hidden_layers * fsdp_config.recompute_ratio)
 
+        frozen_elements = 0
         for layer in tqdm(model.model.layers, desc="Loading layers"):
             layer.apply(param_init_fn)
+            if freeze_mlp:
+                frozen_elements += freeze_module_params_(layer.mlp)
             fully_shard(layer, mp_policy=mp_policy, reshard_after_forward=True)
             layer_idx = layer.self_attn.layer_idx
             if layer_idx < num_recompute_layers:
@@ -880,6 +900,13 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
             if fsdp_config.torch_compile:
                 layer = torch.compile(layer)
             model.model.layers[layer_idx] = layer
+
+        if freeze_mlp:
+            get_engine_logger().info(
+                "freeze_mlp: froze %s MLP elements, %s still trainable",
+                frozen_elements,
+                sum(p.numel() for p in model.parameters() if p.requires_grad),
+            )
 
         if config.tie_word_embeddings:
             model.embed_tokens.apply(param_init_fn)
@@ -1196,8 +1223,14 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
 class FSDPQwen2ForCausalLMConfig(AlloyLMModelConfig):
     window_size: int = -1
     model_cls: object = FSDPQwen2ForCausalLM
+    freeze_mlp: bool = False
 
     def build(self) -> "AlloyLMModel":
         assert self.path, "Model path must be specified in the configuration."
         assert self.model_cls is FSDPQwen2ForCausalLM, "Model class must be FSDPQwen2ForCausalLM"
-        return self.model_cls.from_pretrained(self.path, fsdp_config=self.fsdp_config, window_size=self.window_size)
+        return self.model_cls.from_pretrained(
+            self.path,
+            fsdp_config=self.fsdp_config,
+            window_size=self.window_size,
+            freeze_mlp=self.freeze_mlp,
+        )
