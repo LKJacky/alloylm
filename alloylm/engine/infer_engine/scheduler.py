@@ -21,6 +21,9 @@ class TaskItem:
     def __init__(self, session_id):
         self.session_id = session_id
         self.finished_event = asyncio.Event()
+        # Set by the API layer when the caller asked for stream=True: every
+        # sampled token is pushed here as soon as it is decoded.
+        self.stream_queue = None
 
     def __lt__(self, other: "TaskItem"):
         return self.priority < other.priority
@@ -272,6 +275,8 @@ class SchedulerServer:
         tokens, logprobs, entropys = tokens.tolist(), logprobs.tolist(), entropys.tolist()
         for seq, token, logprob, entropy in zip(sessions, tokens, logprobs, entropys):
             seq.device_session.append_input_tokens([token], [logprob], [entropy])
+            if seq.stream_queue is not None:
+                seq.stream_queue.put_nowait(token)
 
     # inference
 

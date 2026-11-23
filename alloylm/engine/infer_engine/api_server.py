@@ -12,7 +12,7 @@ import jinja2
 import ray
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from jinja2 import Template
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from openai.types.chat.chat_completion_tool_union_param import (
@@ -117,6 +117,7 @@ class ChatCompletionRequest(BaseModel):
     max_entropy: float = 100.0
     for_training: bool = False
     chat_template_kwargs: dict = {"thinking": False}
+    stream: bool | None = False  # SSE when true
 
     # unsupported params
     logprobs: bool | None = False
@@ -376,6 +377,8 @@ class APIServer:
 
     async def chat_completion(self, request: ChatCompletionRequest):
         request.clean()
+        if request.stream:
+            return await self.chat_completion_stream(request)
         if request.session_id == -1:
             request.session_id = uuid.uuid4().int  # generate a new session id for this request
             release_at_once = True
@@ -510,6 +513,145 @@ class APIServer:
                 },
             }
 
+    # streaming
+
+    @staticmethod
+    def _sse(payload: dict) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def _chunk(self, request, session_id, delta: dict, finish_reason=None, usage=None):
+        chunk = {
+            "id": str(session_id),
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": request.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if usage is not None:
+            chunk["usage"] = usage
+        return chunk
+
+    async def chat_completion_stream(self, request: ChatCompletionRequest):
+        """OpenAI-style SSE stream: content deltas as they are sampled.
+
+        Tools and reasoning are not split out of the stream (the client sees the
+        raw model text); the blocking path keeps that job.
+        """
+        if request.session_id == -1:
+            request.session_id = uuid.uuid4().int
+            release_at_once = True
+        else:
+            release_at_once = False
+
+        gene_config = GeneConfig(
+            top_p=request.top_p,
+            temperature=request.temperature,
+            total_max_length=request.max_completion_tokens,
+            top_k=request.top_k,
+            stop_token=request.stop,
+            max_entropy=request.max_entropy,
+            release_at_once=release_at_once,
+            enable_thinking=self.thinking_pattern is not None and request.chat_template_kwargs.get("thinking", False),
+        )
+        session: SessionItem = self.get_session(request.session_id)
+        new_messages = request.messages[len(session.messages.messages) :]
+        text = session.render_messages(
+            new_messages, for_generate=True, tools=request.tools, thinking=gene_config.enable_thinking
+        )
+
+        stream_queue: asyncio.Queue = asyncio.Queue()
+        task = asyncio.create_task(self.run_infer(session, gene_config, text=text, stream_queue=stream_queue))
+
+        async def event_stream():
+            emitted = ""
+            buffered: list[int] = []
+            try:
+                while True:
+                    if task.done() and stream_queue.empty():
+                        break
+                    try:
+                        token = await asyncio.wait_for(stream_queue.get(), timeout=0.02)
+                    except TimeoutError:
+                        continue
+                    buffered.append(token)
+                    # A single token can end mid-character: hold the replacement
+                    # char back until the next token completes it.
+                    text_now = self.tokenizer.decode(buffered).rstrip("�")
+                    if text_now != emitted:
+                        delta = text_now.removeprefix(emitted)
+                        emitted = text_now
+                        if delta:
+                            yield self._sse(self._chunk(request, session.session_id, {"content": delta}))
+
+                response, stop_text, input_ids, result = await task
+                await self._finalize(
+                    request, session, gene_config, response, stop_text, input_ids, result, release_at_once
+                )
+                usage = {
+                    "completion_tokens": result["usage"]["output_tokens"],
+                    "prompt_tokens": result["usage"]["history_tokens"] + result["usage"]["input_tokens"],
+                    "total_tokens": result["usage"]["history_tokens"]
+                    + result["usage"]["input_tokens"]
+                    + result["usage"]["output_tokens"],
+                }
+                yield self._sse(self._chunk(request, session.session_id, {}, result["finish_reason"], usage))
+                yield "data: [DONE]\n\n"
+            except Exception as error:  # noqa: BLE001 - a broken stream must still close cleanly
+                self.logger.error(f"stream failed: {error}")
+                yield self._sse(self._chunk(request, session.session_id, {}, "error"))
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    async def _finalize(self, request, session, gene_config, response, stop_text, input_ids, result, release_at_once):
+        """Bookkeeping shared by the blocking and streaming paths."""
+        if gene_config.enable_thinking:
+            response_wo_think, reasoning_content = parse_thinking(response, thinking_pattern=self.thinking_pattern)
+        else:
+            response_wo_think, reasoning_content = response, None
+        if self.tool_pattern:
+            response_wo_tools, tool_calls = parse_tool_calls(response_wo_think, tool_pattern=self.tool_pattern)
+        else:
+            response_wo_tools, tool_calls = response_wo_think, []
+
+        message = {"role": "assistant", "content": response_wo_tools}
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+
+        session.messages.cached_text += response + stop_text
+        session.messages.messages.append(
+            {"role": "assistant", "content": response_wo_think, "reasoning_content": reasoning_content}
+        )
+        session.messages.formated_messages.append(message)
+
+        if request.for_training:
+            output_ids = result["tokens"]
+            session.training_input_ids.extend(input_ids + output_ids)
+            session.training_labels.extend([-100] * len(input_ids) + output_ids)
+            session.training_logprobs.extend([0] * len(input_ids) + result["log_prob"])
+        if release_at_once:
+            await self.release_session(session.session_id, release_cache=False, save_infer_info=request.for_training)
+        self.logger.info(
+            f"Finish {session.session_id} (stream) Release at once: {release_at_once}, "
+            f"history tokens: {result['usage']['history_tokens']}, input tokens: {result['usage']['input_tokens']} "
+            f"output tokens: {result['usage']['output_tokens']}"
+        )
+        return {
+            "id": str(session.session_id),
+            "object": "chat.completion",
+            "created": 0,
+            "model": request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": "tool_calls" if tool_calls else result["finish_reason"],
+                }
+            ],
+        }
+
     # apis for proxy
 
     async def health(self) -> Response:
@@ -550,7 +692,9 @@ class APIServer:
 
     # protocol for infer
 
-    async def run_infer(self, session: SessionItem, gene_config: GeneConfig, text=None, input_tokens=None):
+    async def run_infer(
+        self, session: SessionItem, gene_config: GeneConfig, text=None, input_tokens=None, stream_queue=None
+    ):
         # update stop token
 
         gene_config = await self.tokenize_stop_tokens(gene_config)
@@ -564,6 +708,7 @@ class APIServer:
             return "", [], [], "length", []
         else:
             infer_item = InferItem(session.session_id, input_tokens, gene_config)
+            infer_item.stream_queue = stream_queue
             result = await self.run_on_engine(infer_item)
             if result["finish_reason"] == "stop":
                 decode_text = await asyncio.get_running_loop().run_in_executor(
