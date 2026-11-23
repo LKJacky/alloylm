@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import json
 import os
 import re
 import uuid
@@ -26,6 +25,7 @@ from alloylm.engine.train_engine.utils import get_engine_logger as get_logger
 
 from .infer_bank import InferBank
 from .scheduler import InferItem, ResetItem, TaskItem
+from .stream import ChatStreamer, chunk, sse
 from .utils import GeneConfig, get_current_ip
 
 
@@ -190,51 +190,6 @@ class SessionItem:
         )
 
 
-def parse_tool_calls(text: str, tool_pattern: re.Pattern) -> tuple[str, list[dict]]:
-    matches = list(tool_pattern.finditer(text))
-    if not matches:
-        return text, []
-
-    tool_calls = []
-    try:
-        for match in matches:
-            payload = json.loads(match.group(1))
-            name = payload["name"]
-            arguments = payload.get("arguments", {})
-            if isinstance(arguments, str):
-                arguments = json.loads(arguments)
-            if not isinstance(name, str) or not isinstance(arguments, (dict, list)):
-                raise ValueError("Invalid tool call payload")  # noqa: TRY004
-            tool_calls.append(
-                {
-                    "id": f"call_{uuid.uuid4().hex}",
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
-                    },
-                }
-            )
-        content = tool_pattern.sub("", text).strip()
-        return content, tool_calls
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-        return text, []
-
-
-def parse_thinking(text: str, thinking_pattern: re.Pattern) -> tuple[str | None, str | None]:
-    try:
-        match = next(thinking_pattern.finditer(text))
-    except StopIteration:
-        return "", text
-
-    payload = match.group(1)
-    if payload is not None:
-        return thinking_pattern.sub("", text, count=1), payload
-    else:
-        # thinking pattern is not closed or not properly formatted, assume all content is reasoning content to make sure prefix consistency for chat template
-        return "", text
-
-
 # server
 
 
@@ -243,7 +198,7 @@ class APIServer:
         self,
         tokenizer: AutoTokenizer,
         queue: Queue[GeneConfig],
-        chat_template: Template = None,
+        chat_template: Template | str | None = None,
         port=8000,
         proxy_url=None,
         model_name="",
@@ -254,6 +209,8 @@ class APIServer:
         jinja_env = ImmutableSandboxedEnvironment(
             trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols]
         )
+        if isinstance(chat_template, str):
+            chat_template = jinja_env.from_string(chat_template) if chat_template else None
         self.chat_template = chat_template if chat_template else jinja_env.from_string(tokenizer.get_chat_template())
         test_messages = [
             {"role": "system", "content": "You are a helpful assistant."},
@@ -376,173 +333,29 @@ class APIServer:
             self.running_session.discard(session_id)
 
     async def chat_completion(self, request: ChatCompletionRequest):
-        request.clean()
+        request.clean()  # shared by both paths: max_tokens -> max_completion_tokens
         if request.stream:
-            return await self.chat_completion_stream(request)
-        if request.session_id == -1:
-            request.session_id = uuid.uuid4().int  # generate a new session id for this request
-            release_at_once = True
-        else:
-            release_at_once = False
-            if len(request.messages) == 0:  # release session
-                await self.release_session(request.session_id, save_infer_info=request.for_training)
-                return {
-                    "id": str(request.session_id),
-                    "object": "chat.completion",
-                    "created": 0,
-                    "model": request.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": ""},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": {
-                        "completion_tokens": 0,
-                        "prompt_tokens": 0,
-                        "total_tokens": 0,
-                    },
-                }
-        with self.run_session(request.session_id):
-            gene_config = GeneConfig(
-                top_p=request.top_p,
-                temperature=request.temperature,
-                total_max_length=request.max_completion_tokens,
-                top_k=request.top_k,
-                stop_token=request.stop,
-                max_entropy=request.max_entropy,
-                release_at_once=release_at_once,
-                enable_thinking=self.thinking_pattern is not None
-                and request.chat_template_kwargs.get("thinking", False),
-            )
-            self.logger.info(f"Get a request, {gene_config}")
+            return StreamingResponse(self.completion_stream(request), media_type="text/event-stream")
 
-            session: SessionItem = self.get_session(request.session_id)
-            # get input text
-            new_messages = request.messages[len(session.messages.messages) :]
-            try:
-                text = session.render_messages(
-                    new_messages,
-                    for_generate=True,
-                    tools=request.tools,
-                    thinking=gene_config.enable_thinking,
-                )
-            except TextInconsistencyError:
-                await self.release_session(request.session_id, save_infer_info=request.for_training)
-                self.logger.error(f"Text inconsistency error occurred. Releasing session. {request.session_id}")
-                return {
-                    "id": str(request.session_id),
-                    "object": "chat.completion",
-                    "created": 0,
-                    "model": request.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": ""},
-                            "finish_reason": "error",
-                        }
-                    ],
-                    "usage": {
-                        "completion_tokens": 0,
-                        "prompt_tokens": 0,
-                        "total_tokens": 0,
-                    },
-                }
-
-            # generate
-            response, stop_text, input_ids, result = await self.run_infer(session, gene_config, text=text)
-            # parse tools
-            if gene_config.enable_thinking:
-                response_wo_think, reasoning_content = parse_thinking(response, thinking_pattern=self.thinking_pattern)
-            else:
-                response_wo_think, reasoning_content = response, None
-            if self.tool_pattern:
-                response_wo_tools, tool_calls = parse_tool_calls(response_wo_think, tool_pattern=self.tool_pattern)
-            else:
-                response_wo_tools, tool_calls = response_wo_think, []
-
-            message = {
-                "role": "assistant",
-                "content": response_wo_tools,
-            }
-            if reasoning_content:
-                message["reasoning_content"] = reasoning_content
-            if tool_calls:
-                message["tool_calls"] = tool_calls
-
-            # update session
-            session.messages.cached_text += response + stop_text
-            session.messages.messages.append(
-                {"role": "assistant", "content": response_wo_think, "reasoning_content": reasoning_content}
-            )  # do not parse tools, because they are not reversible
-            session.messages.formated_messages.append(message)
-
-            if request.for_training:
-                output_ids = result["tokens"]
-                session.training_input_ids.extend(input_ids + output_ids)
-                session.training_labels.extend([-100] * len(input_ids) + output_ids)
-                session.training_logprobs.extend([0] * len(input_ids) + result["log_prob"])
-            if release_at_once:
-                await self.release_session(
-                    session.session_id, release_cache=False, save_infer_info=request.for_training
-                )  # cache had been released
-            self.logger.info(
-                f"Finish {session.session_id}  Release at once: {release_at_once}, history tokens: {result['usage']['history_tokens']}, input tokens: {result['usage']['input_tokens']} output tokens: {result['usage']['output_tokens']}"
-            )
-            return {
-                "id": str(session.session_id),
-                "object": "chat.completion",
-                "created": 0,
-                "model": request.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": message,
-                        "finish_reason": "tool_calls" if tool_calls else result["finish_reason"],
-                    }
-                ],
-                "usage": {
-                    "completion_tokens": result["usage"]["output_tokens"],
-                    "prompt_tokens": result["usage"]["history_tokens"] + result["usage"]["input_tokens"],
-                    "total_tokens": (
-                        result["usage"]["history_tokens"]
-                        + result["usage"]["input_tokens"]
-                        + result["usage"]["output_tokens"]
-                    ),
-                },
-            }
-
-    # streaming
-
-    @staticmethod
-    def _sse(payload: dict) -> str:
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-    def _chunk(self, request, session_id, delta: dict, finish_reason=None, usage=None):
-        chunk = {
-            "id": str(session_id),
-            "object": "chat.completion.chunk",
+        # non-streaming: run the very same pipeline, only skip the intermediate yields
+        out: dict = {}
+        async for _ in self.completion_stream(request, out):
+            pass
+        return {
+            "id": str(request.session_id),
+            "object": "chat.completion",
             "created": 0,
             "model": request.model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+            "choices": [{"index": 0, "message": out["message"], "finish_reason": out["finish_reason"]}],
+            "usage": out["usage"] or {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0},
         }
-        if usage is not None:
-            chunk["usage"] = usage
-        return chunk
 
-    async def chat_completion_stream(self, request: ChatCompletionRequest):
-        """OpenAI-style SSE stream: content deltas as they are sampled.
+    async def prepare_completion(self, request, release_at_once):
+        """Build the gene config and render the prompt; shared by both paths.
 
-        Tools and reasoning are not split out of the stream (the client sees the
-        raw model text); the blocking path keeps that job.
+        Returns (session, gene_config, text), or None after releasing the session when the rendered prompt no longer
+        matches the cached history.
         """
-        if request.session_id == -1:
-            request.session_id = uuid.uuid4().int
-            release_at_once = True
-        else:
-            release_at_once = False
-
         gene_config = GeneConfig(
             top_p=request.top_p,
             temperature=request.temperature,
@@ -553,106 +366,163 @@ class APIServer:
             release_at_once=release_at_once,
             enable_thinking=self.thinking_pattern is not None and request.chat_template_kwargs.get("thinking", False),
         )
+        self.logger.info(f"Get a request, {gene_config}")
+
         session: SessionItem = self.get_session(request.session_id)
         new_messages = request.messages[len(session.messages.messages) :]
-        text = session.render_messages(
-            new_messages, for_generate=True, tools=request.tools, thinking=gene_config.enable_thinking
-        )
+        try:
+            text = session.render_messages(
+                new_messages, for_generate=True, tools=request.tools, thinking=gene_config.enable_thinking
+            )
+        except TextInconsistencyError:
+            await self.release_session(request.session_id, save_infer_info=request.for_training)
+            self.logger.error(f"Text inconsistency error occurred. Releasing session. {request.session_id}")
+            return None
+        return session, gene_config, text
 
-        stream_queue: asyncio.Queue = asyncio.Queue()
-        task = asyncio.create_task(self.run_infer(session, gene_config, text=text, stream_queue=stream_queue))
+    async def completion_stream(self, request, out: dict | None = None):
+        """Run one completion, yielding SSE chunks.
 
-        async def event_stream():
-            emitted = ""
-            buffered: list[int] = []
+        This is the only generation pipeline: ``chat_completion`` calls it with ``out`` set,
+        consuming the whole stream without yielding anything, while the streaming endpoint
+        lets every chunk through. ``out`` receives (message, finish_reason, usage).
+        """
+        emit = out is None
+        if request.session_id == -1:
+            request.session_id = uuid.uuid4().int
+            release_at_once = True
+        else:
+            release_at_once = False
+            if len(request.messages) == 0:  # release session
+                await self.release_session(request.session_id, save_infer_info=request.for_training)
+                if out is not None:
+                    out.update(message={"role": "assistant", "content": ""}, finish_reason="stop", usage=None)
+                if emit:
+                    yield sse(chunk(request, request.session_id, {"content": ""}, "stop"))
+                    yield "data: [DONE]\n\n"
+                return
+
+        with self.run_session(request.session_id):
+            prepared = await self.prepare_completion(request, release_at_once)
+            if prepared is None:
+                if out is not None:
+                    out.update(message={"role": "assistant", "content": ""}, finish_reason="error", usage=None)
+                if emit:
+                    yield sse(chunk(request, request.session_id, {}, "error"))
+                    yield "data: [DONE]\n\n"
+                return
+            session, gene_config, text = prepared
+
+            stream_queue: asyncio.Queue = asyncio.Queue()
+            task = asyncio.create_task(self.run_infer(session, gene_config, text=text, stream_queue=stream_queue))
+            streamer = ChatStreamer(
+                tokenizer=self.tokenizer,
+                thinking_pattern=self.thinking_pattern,
+                tool_pattern=self.tool_pattern,
+                enable_thinking=gene_config.enable_thinking,
+            )
+            # the final message is assembled from the streamed deltas, the same ones the
+            # client sees, so the two paths cannot disagree
+            reasoning_parts: list[str] = []
+            content_parts: list[str] = []
+            tool_calls: dict[int, dict] = {}
+            finalized = False
             try:
-                while True:
-                    if task.done() and stream_queue.empty():
-                        break
-                    try:
-                        token = await asyncio.wait_for(stream_queue.get(), timeout=0.02)
-                    except TimeoutError:
-                        continue
-                    buffered.append(token)
-                    # A single token can end mid-character: hold the replacement
-                    # char back until the next token completes it.
-                    text_now = self.tokenizer.decode(buffered).rstrip("�")
-                    if text_now != emitted:
-                        delta = text_now.removeprefix(emitted)
-                        emitted = text_now
-                        if delta:
-                            yield self._sse(self._chunk(request, session.session_id, {"content": delta}))
-
-                response, stop_text, input_ids, result = await task
-                await self._finalize(
-                    request, session, gene_config, response, stop_text, input_ids, result, release_at_once
+                async for delta in streamer.stream(stream_queue, task):
+                    if emit:
+                        yield sse(chunk(request, session.session_id, delta))
+                    if "reasoning_content" in delta:
+                        reasoning_parts.append(delta["reasoning_content"])
+                    if "content" in delta:
+                        content_parts.append(delta["content"])
+                    for call in delta.get("tool_calls", ()):
+                        tool_calls[call["index"]] = {
+                            "id": call["id"],
+                            "type": call["type"],
+                            "function": call["function"],
+                        }
+                _, _, input_ids, result = await task
+                message, finish_reason, usage = await self._finalize(
+                    request,
+                    session,
+                    gene_config,
+                    "".join(reasoning_parts),
+                    "".join(content_parts),
+                    streamer.state.body,  # raw text, tool-call markers included
+                    [tool_calls[index] for index in sorted(tool_calls)],
+                    input_ids,
+                    result,
                 )
-                usage = {
-                    "completion_tokens": result["usage"]["output_tokens"],
-                    "prompt_tokens": result["usage"]["history_tokens"] + result["usage"]["input_tokens"],
-                    "total_tokens": result["usage"]["history_tokens"]
-                    + result["usage"]["input_tokens"]
-                    + result["usage"]["output_tokens"],
-                }
-                yield self._sse(self._chunk(request, session.session_id, {}, result["finish_reason"], usage))
+                finalized = True
+                if out is not None:
+                    out.update(message=message, finish_reason=finish_reason, usage=usage)
+                if emit:
+                    yield sse(chunk(request, session.session_id, {}, finish_reason, usage))
+                    yield "data: [DONE]\n\n"
+            except Exception as error:
+                self.logger.error(f"completion failed: {error}")
+                if out is not None:
+                    raise  # non-streaming callers must see the failure, not a fake 200
+                yield sse(chunk(request, session.session_id, {}, "error"))
                 yield "data: [DONE]\n\n"
-            except Exception as error:  # noqa: BLE001 - a broken stream must still close cleanly
-                self.logger.error(f"stream failed: {error}")
-                yield self._sse(self._chunk(request, session.session_id, {}, "error"))
-                yield "data: [DONE]\n\n"
+            finally:
+                if not finalized:
+                    # also covers client disconnects (CancelledError / GeneratorExit)
+                    task.cancel()
+                    try:
+                        await self.release_session(session.session_id, release_cache=True)
+                    except Exception:  # noqa: BLE001 - releasing is best effort
+                        self.logger.warning("failed to release session after an unfinished stream")
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+    async def _finalize(
+        self, request, session, gene_config, reasoning_content, content, raw_content, tool_calls, input_ids, result
+    ):
+        """Bookkeeping shared by the blocking and streaming paths.
 
-    async def _finalize(self, request, session, gene_config, response, stop_text, input_ids, result, release_at_once):
-        """Bookkeeping shared by the blocking and streaming paths."""
-        if gene_config.enable_thinking:
-            response_wo_think, reasoning_content = parse_thinking(response, thinking_pattern=self.thinking_pattern)
-        else:
-            response_wo_think, reasoning_content = response, None
-        if self.tool_pattern:
-            response_wo_tools, tool_calls = parse_tool_calls(response_wo_think, tool_pattern=self.tool_pattern)
-        else:
-            response_wo_tools, tool_calls = response_wo_think, []
-
-        message = {"role": "assistant", "content": response_wo_tools}
+        ``reasoning_content`` / ``content`` / ``tool_calls`` are the accumulated stream deltas;
+        returns (assistant message, finish_reason, usage).
+        """
+        message = {"role": "assistant", "content": content}
         if reasoning_content:
             message["reasoning_content"] = reasoning_content
         if tool_calls:
             message["tool_calls"] = tool_calls
 
-        session.messages.cached_text += response + stop_text
         session.messages.messages.append(
-            {"role": "assistant", "content": response_wo_think, "reasoning_content": reasoning_content}
-        )
+            {"role": "assistant", "content": raw_content, "reasoning_content": reasoning_content or None}
+        )  # tool calls are not reversible, keep the raw text in the history
         session.messages.formated_messages.append(message)
+        # cached_text must be what the chat template renders for this history: the next turn
+        # renders the same history again and compares its own text against this prefix
+        session.messages.cached_text = session.messages._get_text(
+            session.messages.messages,
+            add_generation_prompt=False,
+            tools=request.tools,
+            thinking=gene_config.enable_thinking,
+        )
 
         if request.for_training:
             output_ids = result["tokens"]
             session.training_input_ids.extend(input_ids + output_ids)
             session.training_labels.extend([-100] * len(input_ids) + output_ids)
             session.training_logprobs.extend([0] * len(input_ids) + result["log_prob"])
-        if release_at_once:
-            await self.release_session(session.session_id, release_cache=False, save_infer_info=request.for_training)
+        if gene_config.release_at_once:
+            await self.release_session(
+                session.session_id, release_cache=False, save_infer_info=request.for_training
+            )  # the cache had already been released
         self.logger.info(
-            f"Finish {session.session_id} (stream) Release at once: {release_at_once}, "
+            f"Finish {session.session_id} Release at once: {gene_config.release_at_once}, "
             f"history tokens: {result['usage']['history_tokens']}, input tokens: {result['usage']['input_tokens']} "
             f"output tokens: {result['usage']['output_tokens']}"
         )
-        return {
-            "id": str(session.session_id),
-            "object": "chat.completion",
-            "created": 0,
-            "model": request.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": message,
-                    "finish_reason": "tool_calls" if tool_calls else result["finish_reason"],
-                }
-            ],
+        usage = {
+            "completion_tokens": result["usage"]["output_tokens"],
+            "prompt_tokens": result["usage"]["history_tokens"] + result["usage"]["input_tokens"],
+            "total_tokens": result["usage"]["history_tokens"]
+            + result["usage"]["input_tokens"]
+            + result["usage"]["output_tokens"],
         }
-
-    # apis for proxy
+        return message, "tool_calls" if tool_calls else result["finish_reason"], usage
 
     async def health(self) -> Response:
         """Health check."""
@@ -705,7 +575,23 @@ class APIServer:
 
         # generate
         if gene_config.total_max_length <= 0:
-            return "", [], [], "length", []
+            # no room left to decode: keep the same 4-tuple shape as the normal path
+            return (
+                "",
+                "",
+                input_tokens,
+                {
+                    "tokens": [],
+                    "log_prob": [],
+                    "entropy": [],
+                    "finish_reason": "length",
+                    "usage": {
+                        "history_tokens": session.forwarded_tokens,
+                        "input_tokens": len(input_tokens),
+                        "output_tokens": 0,
+                    },
+                },
+            )
         else:
             infer_item = InferItem(session.session_id, input_tokens, gene_config)
             infer_item.stream_queue = stream_queue
