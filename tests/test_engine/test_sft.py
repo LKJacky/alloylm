@@ -48,7 +48,7 @@ class FakeTokenizer:
         return [ord(c) for c in text]
 
 
-def chat_template(messages, add_generation_prompt=False):
+def chat_template(messages, add_generation_prompt=False, tools=None, enable_thinking=False):
     text = ""
     for msg in messages:
         text += f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n"
@@ -62,15 +62,15 @@ class CharacterTokenizer:
         return list(text)
 
 
-def render_messages(messages, add_generation_prompt=False):
+def render_messages(messages, add_generation_prompt=False, tools=None, enable_thinking=False):
     return "".join(message["content"] for message in messages)
 
 
 class TestSFTPackDataset(unittest.IsolatedAsyncioTestCase):
     async def test_ray_token_counting_preserves_samples_and_ratio(self):
         records = [
-            {"messages": [{"role": "user", "content": "a"}]},
-            {"messages": [{"role": "user", "content": "bb"}]},
+            {"messages": [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]},
+            {"messages": [{"role": "user", "content": "bb"}, {"role": "assistant", "content": "cc"}]},
         ]
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "data.jsonl"
@@ -85,7 +85,8 @@ class TestSFTPackDataset(unittest.IsolatedAsyncioTestCase):
             )
             await dataset.lazy_init()
 
-        self.assertEqual([item[2] for item in dataset.data], [1, 2, 1, 2])
+        # a+b = 2 tokens, bb+cc = 4 tokens, each sample repeated twice (ratio 2.0)
+        self.assertEqual([item[2] for item in dataset.data], [2, 4, 2, 4])
         self.assertEqual(len(dataset.data), 4)
 
 
