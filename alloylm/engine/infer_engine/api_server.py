@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import os
 import re
 import uuid
@@ -10,7 +11,7 @@ import httpx
 import jinja2
 import ray
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from jinja2 import Template
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -332,14 +333,16 @@ class APIServer:
         finally:
             self.running_session.discard(session_id)
 
-    async def chat_completion(self, request: ChatCompletionRequest):
+    async def chat_completion(self, request: ChatCompletionRequest, raw_request: Request = None):
         request.clean()  # shared by both paths: max_tokens -> max_completion_tokens
         if request.stream:
-            return StreamingResponse(self.completion_stream(request), media_type="text/event-stream")
+            return StreamingResponse(
+                self.completion_stream(request, raw_request=raw_request), media_type="text/event-stream"
+            )
 
         # non-streaming: run the very same pipeline, only skip the intermediate yields
         out: dict = {}
-        async for _ in self.completion_stream(request, out):
+        async for _ in self.completion_stream(request, out, raw_request=raw_request):
             pass
         return {
             "id": str(request.session_id),
@@ -349,6 +352,22 @@ class APIServer:
             "choices": [{"index": 0, "message": out["message"], "finish_reason": out["finish_reason"]}],
             "usage": out["usage"] or {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0},
         }
+
+    @staticmethod
+    def session_id_from_api_key(raw_request) -> int | None:
+        """Stable session id derived from the "Authorization: Bearer <key>"
+        header."""
+        headers = getattr(raw_request, "headers", None)
+        if not headers:
+            return None
+        token = headers.get("authorization") or ""
+        if token.lower().startswith("bearer "):
+            token = token[7:]
+        token = token.strip()
+        if not token:
+            return None
+        digest = hashlib.sha256(token.encode()).digest()
+        return int.from_bytes(digest[:8], "big") >> 1  # 63 bits, never -1
 
     async def prepare_completion(self, request, release_at_once):
         """Build the gene config and render the prompt; shared by both paths.
@@ -380,7 +399,7 @@ class APIServer:
             return None
         return session, gene_config, text
 
-    async def completion_stream(self, request, out: dict | None = None):
+    async def completion_stream(self, request, out: dict | None = None, raw_request=None):
         """Run one completion, yielding SSE chunks.
 
         This is the only generation pipeline: ``chat_completion`` calls it with ``out`` set,
@@ -389,18 +408,26 @@ class APIServer:
         """
         emit = out is None
         if request.session_id == -1:
-            request.session_id = uuid.uuid4().int
-            release_at_once = True
+            # no session was given: key the conversation on the API key, so a stateless
+            # client keeps its history (and its KV cache) across requests
+            api_key_session_id = self.session_id_from_api_key(raw_request)
+            if api_key_session_id is not None:
+                request.session_id = api_key_session_id
+                release_at_once = False  # keep the session for the next request of that key
+            else:
+                request.session_id = uuid.uuid4().int
+                release_at_once = True
         else:
             release_at_once = False
-            if len(request.messages) == 0:  # release session
-                await self.release_session(request.session_id, save_infer_info=request.for_training)
-                if out is not None:
-                    out.update(message={"role": "assistant", "content": ""}, finish_reason="stop", usage=None)
-                if emit:
-                    yield sse(chunk(request, request.session_id, {"content": ""}, "stop"))
-                    yield "data: [DONE]\n\n"
-                return
+
+        if len(request.messages) == 0:  # release session, whichever way it was addressed
+            await self.release_session(request.session_id, save_infer_info=request.for_training)
+            if out is not None:
+                out.update(message={"role": "assistant", "content": ""}, finish_reason="stop", usage=None)
+            if emit:
+                yield sse(chunk(request, request.session_id, {"content": ""}, "stop"))
+                yield "data: [DONE]\n\n"
+            return
 
         with self.run_session(request.session_id):
             prepared = await self.prepare_completion(request, release_at_once)

@@ -20,8 +20,8 @@ logger = get_logger()
 
 class TestLaunchSystem(CudaAsyncTestCase):
     async def try_forward_interactive(self, port=8000):
-        from openai import AsyncClient
-
+        """Run a two turn conversation twice: once with an explicit ``session_id``,
+        once with the session keyed on the API key (no session_id sent)."""
         all_prompts = [
             [
                 (
@@ -38,31 +38,57 @@ class TestLaunchSystem(CudaAsyncTestCase):
                 ({"role": "user", "content": "how much is 5 apples?"}, "25"),
             ],
         ]
-        client = AsyncClient(api_key="EMPTY", base_url=f"http://localhost:{port}/v1")
-
         prompt = random.choice(all_prompts)
-        messages = []
-        uuid_val = uuid.uuid4().int
-        for p, answer in prompt:
-            messages.append(p)
-            output = await client.chat.completions.create(
-                model="ALLOYLM",
-                messages=messages,
-                max_completion_tokens=4096,
-                extra_body={"top_k": 1, "session_id": uuid_val},
-            )
-            output_str = output.choices[0].message.content
-            messages.append({"role": "assistant", "content": output_str})
 
-            self.assertTrue(
-                answer.lower() in output_str.lower(),
-                msg=f"Interactive Test failed: Prompt: {p['content']}, Expected '{answer}', got '{output_str}'",
-            )
+        async def run_conversation(use_api_key: bool):
+            api_key = uuid.uuid4().hex if use_api_key else "EMPTY"
+            session_id = uuid.uuid4().int
+            mode = "api key" if use_api_key else "session_id"
+            client = AsyncClient(api_key=api_key, base_url=f"http://localhost:{port}/v1")
+            response_ids = set()
+            try:
+                messages = []
+                for p, answer in prompt:
+                    messages.append(p)
+                    extra_body = {"top_k": 1}
+                    if not use_api_key:
+                        extra_body["session_id"] = session_id
+                    output = await client.chat.completions.create(
+                        model="ALLOYLM",
+                        messages=messages,
+                        max_completion_tokens=4096,
+                        extra_body=extra_body,
+                    )
+                    response_ids.add(output.id)
+                    output_str = output.choices[0].message.content
+                    messages.append({"role": "assistant", "content": output_str})
 
-        await client.chat.completions.create(
-            model="ALLOYLM", messages=[], extra_body={"session_id": uuid_val}
-        )  # release session
-        await client.close()
+                    self.assertTrue(
+                        answer.lower() in output_str.lower(),
+                        msg=(
+                            f"Interactive Test failed ({mode}): Prompt: {p['content']}, "
+                            f"Expected '{answer}', got '{output_str}'"
+                        ),
+                    )
+
+                # the whole conversation must stay on one session
+                self.assertEqual(
+                    len(response_ids), 1, msg=f"Interactive Test failed ({mode}): session id changed between turns"
+                )
+                if not use_api_key:
+                    self.assertEqual(
+                        response_ids.pop(),
+                        str(session_id),
+                        msg=f"Interactive Test failed ({mode}): id does not match the given session_id",
+                    )
+            finally:
+                # an empty message list releases the session, whichever way it was addressed
+                release_body = {} if use_api_key else {"session_id": session_id}
+                await client.chat.completions.create(model="ALLOYLM", messages=[], extra_body=release_body)
+                await client.close()
+
+        await run_conversation(use_api_key=False)
+        await run_conversation(use_api_key=True)
 
     async def try_forward_complete(self, port=8000):
         prompts = [
@@ -71,7 +97,9 @@ class TestLaunchSystem(CudaAsyncTestCase):
             ({"role": "user", "content": "what is the capital of France?"}, "Paris"),
             ({"role": "user", "content": "what is the capital of Japan?"}, "Tokyo"),
         ]
-        client = AsyncClient(api_key="EMPTY", base_url=f"http://localhost:{port}/v1")
+        # no session_id: the conversation is keyed on the API key, so give each
+        # concurrent task its own key
+        client = AsyncClient(api_key=uuid.uuid4().hex, base_url=f"http://localhost:{port}/v1")
         prompt, answer = random.choice(prompts)
         response = await client.chat.completions.create(
             model="ALLOYLM",
