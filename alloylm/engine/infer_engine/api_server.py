@@ -29,6 +29,12 @@ from .scheduler import InferItem, ResetItem, TaskItem
 from .stream import ChatStreamer, chunk, sse
 from .utils import GeneConfig, get_current_ip
 
+# a conversation key is exactly 32 characters and starts with this prefix, e.g.
+# "session" + 25 random characters. Anything else (the "EMPTY" that clients send when
+# they do not use keys, for instance) does not identify a conversation.
+API_KEY_SESSION_PREFIX = "session"
+API_KEY_SESSION_LENGTH = 32
+
 
 class ModelCard(_BaseModel):
     id: str
@@ -356,7 +362,7 @@ class APIServer:
     @staticmethod
     def session_id_from_api_key(raw_request) -> int | None:
         """Stable session id derived from the "Authorization: Bearer <key>"
-        header."""
+        header, or None when the key cannot identify a conversation."""
         headers = getattr(raw_request, "headers", None)
         if not headers:
             return None
@@ -364,7 +370,7 @@ class APIServer:
         if token.lower().startswith("bearer "):
             token = token[7:]
         token = token.strip()
-        if not token:
+        if len(token) != API_KEY_SESSION_LENGTH or not token.startswith(API_KEY_SESSION_PREFIX):
             return None
         digest = hashlib.sha256(token.encode()).digest()
         return int.from_bytes(digest[:8], "big") >> 1  # 63 bits, never -1

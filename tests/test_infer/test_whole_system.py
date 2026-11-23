@@ -41,7 +41,8 @@ class TestLaunchSystem(CudaAsyncTestCase):
         prompt = random.choice(all_prompts)
 
         async def run_conversation(use_api_key: bool):
-            api_key = uuid.uuid4().hex if use_api_key else "EMPTY"
+            # a conversation key is "session" + 25 characters, 32 in total
+            api_key = f"session{uuid.uuid4().hex[:25]}" if use_api_key else "EMPTY"
             session_id = uuid.uuid4().int
             mode = "api key" if use_api_key else "session_id"
             client = AsyncClient(api_key=api_key, base_url=f"http://localhost:{port}/v1")
