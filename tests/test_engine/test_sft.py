@@ -47,6 +47,10 @@ class FakeTokenizer:
     def encode(self, text, add_special_tokens=False):
         return [ord(c) for c in text]
 
+    @property
+    def eos_token(self):
+        return "<|eos|>"
+
 
 def chat_template(messages, add_generation_prompt=False, tools=None, enable_thinking=False):
     text = ""

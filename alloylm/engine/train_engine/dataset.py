@@ -11,8 +11,6 @@ from torch import distributed as dist
 from torch.utils.data import ConcatDataset, Dataset
 from transformers import AutoTokenizer
 
-from alloylm.utils import get_logger
-
 from .utils import pad_and_split_for_sp
 
 
@@ -27,7 +25,7 @@ def remove_common(a: str, b: str):
     return a[i:], b[i:]
 
 
-def distangle_train_or_not_train(messages: list[dict], chat_template, tools):
+def distangle_train_or_not_train(messages: list[dict], chat_template, tools, eos: str | None):
     # distinguish between has loss or not.
     converted_messages = []
     pre_text = ""
@@ -53,9 +51,31 @@ def distangle_train_or_not_train(messages: list[dict], chat_template, tools):
             assert text.startswith(pre_text), (
                 f"not match prefix p2 \n{'\n-------------------------------\n'.join(remove_common(text, pre_text))}"
             )
-            converted_messages.append((text[len(pre_text) :], True))  # Append only the new part of the text
+            assistant_text: str = text[len(pre_text) :]
+            if eos and eos in assistant_text:
+                assistant_text, after_eos = assistant_text.rsplit(eos, 1)
+                if message.get("finish_reason", "stop") == "stop":
+                    converted_messages.append((assistant_text + eos, True))
+                    converted_messages.append((after_eos, False))
+                else:
+                    converted_messages.append((assistant_text, True))
+                    converted_messages.append((eos + after_eos, False))
+            else:
+                converted_messages.append((assistant_text, True))  # Append only the new part of the text
             pre_text = text
 
+    # remove last no loss messages
+    while len(converted_messages) > 0 and converted_messages[-1][1] is False:
+        converted_messages.pop()
+    # merge consecutive messages with the same loss flag
+    merged_messages = []
+    for text, has_loss in converted_messages:
+        if merged_messages and merged_messages[-1][1] == has_loss:
+            merged_messages[-1] = (merged_messages[-1][0] + text, has_loss)
+        else:
+            merged_messages.append((text, has_loss))
+    converted_messages = merged_messages
+    # return
     return converted_messages
 
 
@@ -73,7 +93,8 @@ def tokenize_messages(messages, chat_template, tokenizer, tools):
                 labels.extend([-100] * len(tokenized))  # Mask out tokens that don't contribute to loss
         return input_ids, labels
 
-    converted_messages = distangle_train_or_not_train(messages, chat_template, tools=tools)
+    eos = getattr(tokenizer, "eos_token", None)
+    converted_messages = distangle_train_or_not_train(messages, chat_template, tools=tools, eos=eos)
     return tokenize(converted_messages, tokenizer)
 
 

@@ -205,8 +205,9 @@ class SFTPackDataset(Dataset):
         data = orjson.loads(line)
         messages = data["messages"]
         content = ""
+        eos = getattr(self.tokenizer, "eos_token", None)
         for item, compute_loss in distangle_train_or_not_train(
-            messages, self.chat_template, tools=data.get("tools", None)
+            messages, self.chat_template, tools=data.get("tools", None), eos=eos
         ):
             if compute_loss:
                 content += f"<loss>{item}</loss>"
