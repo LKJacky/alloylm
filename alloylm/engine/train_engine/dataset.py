@@ -54,7 +54,7 @@ def distangle_train_or_not_train(messages: list[dict], chat_template, tools, eos
             assistant_text: str = text[len(pre_text) :]
             if eos and eos in assistant_text:
                 assistant_text, after_eos = assistant_text.rsplit(eos, 1)
-                if message.get("finish_reason", "stop") == "stop":
+                if message.get("finish_reason", "stop") in {"stop", "tool_calls"}:
                     converted_messages.append((assistant_text + eos, True))
                     converted_messages.append((after_eos, False))
                 else:
