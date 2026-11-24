@@ -146,7 +146,7 @@ class AlloyLMModelConfig(PydanticBaseModel):
     fsdp_config: FSDPConfig = FSDPConfig()
 
     def model_post_init(self, context):
-        if self.tokenizer_path is None:
+        if self.tokenizer_path is None or self.tokenizer_path == "":
             self.tokenizer_path = self.path
         return super().model_post_init(context)
 
