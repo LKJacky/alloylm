@@ -57,7 +57,7 @@ class TrainInferEngine:
         )
         self.model = model_config.build()
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_config.path,
+            model_config.tokenizer_path,
             use_fast=True,
             padding_side="right",
             trust_remote_code=True,
