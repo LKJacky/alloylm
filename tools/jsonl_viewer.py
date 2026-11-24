@@ -18,6 +18,10 @@ from pathlib import Path
 
 import orjson
 
+# The message keys the viewer already renders in their own blocks; every other
+# key is shown as a JSON block of its own.
+KNOWN_MESSAGE_KEYS = {"role", "content", "reasoning_content", "tool_calls", "tool_call_id"}
+
 
 def resolve_jsonl_files(inputs: list[str]) -> list[str]:
     """Expand input files and directories into a stable, deduplicated file
@@ -71,7 +75,9 @@ def print_plain(files: list[str]) -> None:
                 record = orjson.loads(line)
                 metric = record.get("metric", "-")
                 finish_reason = record.get("finish_reason") or "-"
-                tokens = " / ".join(str(record.get(key, "-")) for key in ("input_tokens", "output_tokens", "total_tokens"))
+                tokens = " / ".join(
+                    str(record.get(key, "-")) for key in ("input_tokens", "output_tokens", "total_tokens")
+                )
                 print(
                     f"[{index}] id: {record.get('id', '?')}  metric: {metric}  finish_reason: {finish_reason}  tokens: {tokens}"
                 )
@@ -90,10 +96,14 @@ def print_plain(files: list[str]) -> None:
                     for call in msg.get("tool_calls") or []:
                         fn = call.get("function") or call
                         print(f"  - {fn.get('name', '?')} {fn.get('arguments') or ''}")
+                    extra = {k: v for k, v in msg.items() if k not in KNOWN_MESSAGE_KEYS}
+                    if extra:
+                        print("  extra: " + orjson.dumps(extra, option=orjson.OPT_INDENT_2).decode())
                 print()
 
 
 PAGE_SIZE = 100
+
 
 class JsonlStore:
     """One jsonl file: byte offsets now, parsed records on demand.
@@ -106,7 +116,7 @@ class JsonlStore:
 
     def __init__(self, path: str, cache_size: int = 32) -> None:
         self.path = path
-        self._handle = open(path, "rb")
+        self._handle = open(path, "rb")  # noqa: SIM115
         self._lock = threading.Lock()
         self._offsets: list[int] = []
         self._eof = False
@@ -189,6 +199,7 @@ def record_summary(index: int, record: dict) -> dict:
         "num_steps": sum(1 for message in messages if message.get("role") == "assistant"),
     }
 
+
 INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -233,6 +244,8 @@ pre{white-space:pre-wrap;word-break:break-word;margin:6px 0}
 .rlbl{color:var(--reason);font-weight:700;margin-bottom:2px}
 pre.toolcall{color:var(--tool)}
 .others{color:var(--dim);margin-top:10px}
+.extra{background:#f6f8fa;border:1px dashed #d0d7de;border-radius:6px;padding:6px 10px;margin:6px 0}
+.extra .rlbl{color:var(--dim)}
 button.showall{background:none;border:none;color:var(--accent);cursor:pointer;font:inherit;padding:0}
 #footer{padding:6px 12px;border-top:1px solid var(--border);color:var(--dim);background:var(--panel)}
 </style>
@@ -341,6 +354,8 @@ async function openRecord(i) {
   renderDetail(rec);
 }
 
+const KNOWN_MESSAGE_KEYS = new Set(['role', 'content', 'reasoning_content', 'tool_calls', 'tool_call_id']);
+
 function metricLabel(m) { return m === 1.0 ? 'ok' : (m === 0.0 ? 'bad' : '-'); }
 
 function renderDetail(rec) {
@@ -377,7 +392,13 @@ function msgHtml(m) {
     const args = typeof f.arguments === 'string' ? f.arguments : JSON.stringify(f.arguments || '');
     return `<pre class="toolcall">- ${esc(f.name || '?')} ${esc(args)}</pre>`;
   }).join('');
-  const body = role === 'assistant' ? reasoning + content + tools : content + reasoning + tools;
+  const extraKeys = Object.keys(m).filter((k) => !KNOWN_MESSAGE_KEYS.has(k));
+  const extras = extraKeys.map((k) => {
+    const value = m[k];
+    const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    return `<div class="extra"><div class="rlbl">${esc(k)}</div><pre>${escTrunc(text)}</pre></div>`;
+  }).join('');
+  const body = role === 'assistant' ? reasoning + content + tools + extras : content + reasoning + tools + extras;
   return `<div class="msg ${roleClass}">${head}${body}</div>`;
 }
 
@@ -461,8 +482,7 @@ def run_web(files: list[str], host: str, port: int) -> None:
     @app.get("/api/files")
     def api_files():
         return [
-            {"name": name, "total": store.known if store.complete else None}
-            for name, store in zip(file_names, stores)
+            {"name": name, "total": store.known if store.complete else None} for name, store in zip(file_names, stores)
         ]
 
     @app.get("/api/list/{file_idx}")
