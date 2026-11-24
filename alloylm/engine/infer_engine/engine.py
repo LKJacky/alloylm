@@ -147,6 +147,9 @@ class InferEngine:
         self.api_server.cached_infer_info.bank.clear()
         return cached_infer_info
 
+    def get_server_ip(self):
+        return self.url
+
 
 class SPMDInferConfig(PydanticBaseModel):
     llm_config: AlloyLMModelConfig
