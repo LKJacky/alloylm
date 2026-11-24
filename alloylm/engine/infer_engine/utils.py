@@ -1,8 +1,34 @@
 # unified server
+import hashlib
 import socket
 
 from torch import distributed as dist
 from torch.distributed._composable.fsdp import FSDPModule
+
+# a conversation key is exactly 32 characters and starts with this prefix, e.g.
+# "session" + 25 random characters. Anything else (the "EMPTY" that clients send when
+# they do not use keys, for instance) does not identify a conversation.
+API_KEY_SESSION_PREFIX = "session"
+API_KEY_SESSION_LENGTH = 32
+
+
+def session_id_from_api_key(request_or_headers) -> int | None:
+    """Stable session id derived from the "Authorization: Bearer <key>" header,
+    or None when the key cannot identify a conversation.
+
+    ``request_or_headers`` may be a starlette ``Request`` or a plain header mapping.
+    """
+    headers = getattr(request_or_headers, "headers", None) or request_or_headers
+    if not headers:
+        return None
+    token = headers.get("authorization") or ""
+    if token.lower().startswith("bearer "):
+        token = token[7:]
+    token = token.strip()
+    if len(token) != API_KEY_SESSION_LENGTH or not token.startswith(API_KEY_SESSION_PREFIX):
+        return None
+    digest = hashlib.sha256(token.encode()).digest()
+    return int.from_bytes(digest[:8], "big") >> 1  # 63 bits, never -1
 
 
 class GeneConfig:

@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import hashlib
 import os
 import re
 import uuid
@@ -28,12 +27,7 @@ from .infer_bank import InferBank
 from .scheduler import InferItem, ResetItem, TaskItem
 from .stream import ChatStreamer, chunk, sse
 from .utils import GeneConfig, get_current_ip
-
-# a conversation key is exactly 32 characters and starts with this prefix, e.g.
-# "session" + 25 random characters. Anything else (the "EMPTY" that clients send when
-# they do not use keys, for instance) does not identify a conversation.
-API_KEY_SESSION_PREFIX = "session"
-API_KEY_SESSION_LENGTH = 32
+from .utils import session_id_from_api_key as api_key_session_id
 
 
 class ModelCard(_BaseModel):
@@ -363,17 +357,7 @@ class APIServer:
     def session_id_from_api_key(raw_request) -> int | None:
         """Stable session id derived from the "Authorization: Bearer <key>"
         header, or None when the key cannot identify a conversation."""
-        headers = getattr(raw_request, "headers", None)
-        if not headers:
-            return None
-        token = headers.get("authorization") or ""
-        if token.lower().startswith("bearer "):
-            token = token[7:]
-        token = token.strip()
-        if len(token) != API_KEY_SESSION_LENGTH or not token.startswith(API_KEY_SESSION_PREFIX):
-            return None
-        digest = hashlib.sha256(token.encode()).digest()
-        return int.from_bytes(digest[:8], "big") >> 1  # 63 bits, never -1
+        return api_key_session_id(raw_request)
 
     async def prepare_completion(self, request, release_at_once):
         """Build the gene config and render the prompt; shared by both paths.

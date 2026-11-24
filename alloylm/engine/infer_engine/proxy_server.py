@@ -10,6 +10,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel as PydanticBaseModel
 
+from alloylm.engine.infer_engine.utils import session_id_from_api_key
 from alloylm.engine.train_engine.utils import get_engine_logger as get_logger
 
 # method
@@ -77,6 +78,21 @@ class ProxyServer:
     def get_ip(self):
         return self.ip
 
+    def resolve_session_id(self, request, request_content) -> int | None:
+        """Session this request belongs to: the one in the body, or the one the auth
+        token stands for. None means "not a session", i.e. any server will do.
+
+        The derived id is written back into the body so the backend serves the same
+        session (and keeps its KV cache) instead of inventing a new one.
+        """
+        session_id = request_content.get("session_id", -1)
+        if session_id is None or session_id == -1:
+            session_id = session_id_from_api_key(request)
+            if session_id is None:
+                return None
+            request_content["session_id"] = session_id
+        return session_id
+
     # route schedule
 
     def acquire_server_url(self, model):
@@ -132,8 +148,8 @@ class ProxyServer:
         if not hasattr(self, "interactive_sessions"):
             self.interactive_sessions = {}
         request_content = await request.json()
-        if "session_id" in request_content and request_content.get("session_id") != -1:
-            session_id = request_content.get("session_id")
+        session_id = self.resolve_session_id(request, request_content)
+        if session_id is not None:
             if session_id not in self.interactive_sessions:
                 model_name = request_content.get("model", self.servers.keys().__iter__().__next__())
                 server_url = self.acquire_server_url(model_name)
@@ -153,7 +169,7 @@ class ProxyServer:
         if not hasattr(self, "interactive_sessions"):
             self.interactive_sessions = {}
         request_content = await request.json()
-        session_id = request_content.get("session_id")
+        session_id = self.resolve_session_id(request, request_content)
         if session_id in self.interactive_sessions:
             model_name, server_url = self.interactive_sessions[session_id]
             if request_content.get("interactive_mode", False) is False:  # release session
@@ -172,8 +188,8 @@ class ProxyServer:
         if not hasattr(self, "interactive_sessions"):
             self.interactive_sessions = {}
         request_content = await request.json()
-        session_id = request_content.get("session_id")
-        if session_id != -1:
+        session_id = self.resolve_session_id(request, request_content)
+        if session_id is not None:
             if session_id in self.interactive_sessions:
                 model_name, server_url = self.interactive_sessions[session_id]
             else:
