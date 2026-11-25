@@ -218,6 +218,11 @@ header strong{white-space:nowrap}
 main{flex:1;display:grid;grid-template-columns:minmax(210px,22vw) minmax(430px,38vw) minmax(480px,1fr);min-width:1120px;overflow:hidden}
 .panel{min-width:0;overflow-y:auto;border-right:1px solid var(--border)}
 .panel-title{position:sticky;top:0;z-index:2;margin:0;padding:8px 10px;border-bottom:1px solid var(--border);background:var(--panel);font:600 12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
+.panel-title{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.panel-title button{font:600 11px/1.2 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--accent);background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:3px 7px;cursor:pointer}
+.panel-title button:hover{background:#ddf4ff;border-color:var(--accent)}
+#detail-panel.fullscreen{position:fixed;inset:0;z-index:20;border:0;background:var(--bg);box-shadow:0 0 0 100vmax var(--bg)}
+#detail-panel.fullscreen #detail{max-width:1400px;margin:0 auto;padding:22px 28px}
 #tabs{padding:6px}
 .tab{display:block;padding:7px 9px;cursor:pointer;border-radius:6px;color:var(--dim);overflow-wrap:anywhere}
 .tab:hover{background:#f0f3f6;color:var(--fg)}
@@ -259,12 +264,13 @@ button.showall{background:none;border:none;color:var(--accent);cursor:pointer;fo
 <main>
   <aside id="files" class="panel"><h2 class="panel-title">Files</h2><div id="tabs"></div></aside>
   <section id="list" class="panel"><h2 class="panel-title">Items</h2><table><thead><tr><th>#</th><th>metric</th><th>finish</th><th>tokens</th><th>steps</th><th>id</th></tr></thead><tbody id="rows"></tbody></table></section>
-  <section id="detail-panel" class="panel"><h2 class="panel-title">Content</h2><div id="detail"><div class="meta">Select a record.</div></div></section>
+  <section id="detail-panel" class="panel"><h2 class="panel-title"><span>Content</span><button id="expand-detail" type="button" title="Show Content in the whole window">Full window</button></h2><div id="detail"><div class="meta">Select a record.</div></div></section>
 </main>
 <div id="footer">j/k or &#8593;/&#8595; move &middot; Enter open &middot; g/G top/bottom &middot; / focus search &middot; n/N matches &middot; click row to inspect</div>
 <script>
 const $ = (s) => document.querySelector(s);
 const rowsEl = $('#rows'), detailEl = $('#detail'), searchEl = $('#search'), tabsEl = $('#tabs'), matchEl = $('#matchinfo');
+const detailPanel = $('#detail-panel'), expandDetail = $('#expand-detail');
 let files = [], fileIdx = 0, loaded = [], known = 0, complete = false, loading = false,
     cursor = -1, matches = [], matchIdx = -1;
 const PAGE = 100;
@@ -402,6 +408,15 @@ function msgHtml(m) {
   return `<div class="msg ${roleClass}">${head}${body}</div>`;
 }
 
+function toggleDetailFullscreen(force) {
+  const open = force ?? !detailPanel.classList.contains('fullscreen');
+  detailPanel.classList.toggle('fullscreen', open);
+  expandDetail.textContent = open ? 'Exit full window' : 'Full window';
+  expandDetail.title = open ? 'Return to the three panels' : 'Show Content in the whole window';
+  document.body.classList.toggle('detail-fullscreen', open);
+}
+expandDetail.addEventListener('click', () => toggleDetailFullscreen());
+
 tabsEl.addEventListener('click', (e) => {
   const tab = e.target.closest('.tab');
   if (tab) selectFile(Number(tab.dataset.i));
@@ -445,6 +460,7 @@ document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { searchEl.value = ''; matches = []; matchIdx = -1; matchEl.textContent = ''; }
     return;
   }
+  if (e.key === 'Escape' && detailPanel.classList.contains('fullscreen')) { e.preventDefault(); toggleDetailFullscreen(false); return; }
   if (e.key === '/') { e.preventDefault(); searchEl.focus(); }
   else if (e.key === 'j' || e.key === 'ArrowDown') { e.preventDefault(); cursor = Math.min(cursor + 1, loaded.length - 1); renderList(); }
   else if (e.key === 'k' || e.key === 'ArrowUp') { e.preventDefault(); cursor = Math.max(0, cursor - 1); renderList(); }
