@@ -34,7 +34,9 @@ def distangle_train_or_not_train(messages: list[dict], chat_template, tools, eos
     for i, message in enumerate(messages):
         if message["role"] == "assistant":
             assert i > 0
-            enable_thinking = bool(message.get("reasoning_content"))
+            enable_thinking = (
+                message.get("reasoning_content", None) is not None
+            )  # even "" empty sting also means enable_thinking
             text = render(
                 messages=messages[:i], add_generation_prompt=True, tools=tools, enable_thinking=enable_thinking
             )
