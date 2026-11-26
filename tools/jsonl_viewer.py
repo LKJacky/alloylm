@@ -537,10 +537,6 @@ def run_web(files: list[str], host: str, port: int) -> None:
 
     url = f"http://{host}:{port}"
     print(f"jsonl_viewer: serving {len(files)} file(s) at {url}")
-    try:
-        webbrowser.open(url)
-    except (OSError, webbrowser.Error):
-        print("jsonl_viewer: could not open a browser; visit the URL manually")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
