@@ -338,11 +338,7 @@ class Qwen2Attention(nn.Module):
         sequence_parallel_mesh: DeviceMesh | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
-        if (
-            self.config.use_sliding_window
-            and getattr(self.config, "sliding_window", None) is not None
-            and self.layer_idx >= self.config.max_window_layers
-        ):
+        if self.config.use_sliding_window and getattr(self.config, "sliding_window", None) is not None:
             window_size = (self.config.sliding_window - 1, self.config.sliding_window - 1)
         else:
             window_size = (None, None)
@@ -862,6 +858,7 @@ class FSDPQwen2ForCausalLM(Qwen2ForCausalLM, AlloyLMModel):
             config.use_sliding_window = True
             config.sliding_window = window_size
             config.layer_types = ["sliding_attention"] * config.num_hidden_layers
+            config.max_window_layers = 0
         fsdp_config.init_device_mesh()
         with torch.device("meta"):
             model = cls(config, fsdp_config=fsdp_config).to(fsdp_config.shard_dtype)
