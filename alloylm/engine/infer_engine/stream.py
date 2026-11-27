@@ -147,7 +147,31 @@ class StreamState:
     tool_calls_sent: int = 0
 
 
-def fold_body(state: StreamState, tool_open: str, tool_close: str, hold: int) -> bool:
+def tool_block_is_valid(block: str, tool_pattern: re.Pattern | None) -> bool:
+    """True when every tool-call block in ``block`` is well-formed JSON.
+
+    Parsing is fail-open elsewhere: a malformed block must stay in the visible content
+    (markers included) instead of being dropped, so the client still sees what the model
+    said and can retry.
+    """
+    if not tool_pattern:
+        return False
+    matches = list(tool_pattern.finditer(block))
+    if not matches:
+        return False
+    for match in matches:
+        try:
+            payload = json.loads(match.group(1))
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if not isinstance(payload, dict) or not isinstance(payload.get("name"), str):
+            return False
+    return True
+
+
+def fold_body(
+    state: StreamState, tool_open: str, tool_close: str, hold: int, tool_pattern: re.Pattern | None = None
+) -> bool:
     """Fold new body text into content, skipping tool-call blocks.
 
     Holds back a trailing partial marker so no half tag reaches the client. Returns True when a tool call just closed.
@@ -157,11 +181,20 @@ def fold_body(state: StreamState, tool_open: str, tool_close: str, hold: int) ->
         if state.in_tool_call:
             end_at = state.body.find(tool_close, state.folded) if tool_close else -1
             if end_at < 0:
-                break
-            state.folded = end_at + len(tool_close)
-            state.in_tool_call = False
-            closed_a_call = True
-            continue
+                break  # not find
+            else:
+                block_end = end_at + len(tool_close)
+                block = state.body[state.tool_call_start : block_end]
+                if tool_block_is_valid(block, tool_pattern):
+                    state.folded = block_end
+                    state.in_tool_call = False
+                    closed_a_call = True
+                    continue
+                # malformed block: keep it verbatim in the content, markers included
+                state.content += block
+                state.folded = block_end
+                state.in_tool_call = False
+                continue
         open_at = state.body.find(tool_open, state.folded) if tool_open else -1
         if open_at >= 0:
             state.content += state.body[state.folded : open_at]
@@ -251,7 +284,7 @@ class ChatStreamer:
         """Content stage: consume one piece of text outside any tool call."""
         state = self.state
         state.body += piece
-        closed_a_call = fold_body(state, self.tool_open, self.tool_close, self.hold)
+        closed_a_call = fold_body(state, self.tool_open, self.tool_close, self.hold, self.tool_pattern)
         content_delta = self._content_delta()
         if content_delta:
             yield content_delta
@@ -262,7 +295,7 @@ class ChatStreamer:
         """Tool-call stage: consume one piece from the opening to the closing marker."""
         state = self.state
         state.body += piece
-        closed_a_call = fold_body(state, self.tool_open, self.tool_close, self.hold)
+        closed_a_call = fold_body(state, self.tool_open, self.tool_close, self.hold, self.tool_pattern)
         if closed_a_call:
             yield from self._tool_call_deltas()
         content_delta = self._content_delta()  # text released after the call
