@@ -273,8 +273,7 @@ class ChatStreamer:
         body, reasoning = split_thinking(state.emitted, True, self.thinking_pattern)
         delta = reasoning[state.reasoning_sent :]
         state.reasoning_sent = len(reasoning)
-        if delta:
-            yield {"reasoning_content": delta}
+        yield {"reasoning_content": delta}
         if body:
             # thinking closed: the body is a suffix of the raw text from now on
             state.body = body

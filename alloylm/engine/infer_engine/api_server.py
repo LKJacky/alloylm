@@ -375,7 +375,7 @@ class APIServer:
             release_at_once=release_at_once,
             enable_thinking=self.thinking_pattern is not None and request.chat_template_kwargs.get("thinking", False),
         )
-        self.logger.info(f"Get a request, {gene_config}")
+        self.logger.info(f"Request: {gene_config}")
 
         session: SessionItem = self.get_session(request.session_id)
         new_messages = request.messages[len(session.messages.messages) :]
@@ -500,7 +500,7 @@ class APIServer:
         returns (assistant message, finish_reason, usage).
         """
         message = {"role": "assistant", "content": content}
-        if reasoning_content:
+        if reasoning_content is not None:
             message["reasoning_content"] = reasoning_content
         if tool_calls:
             message["tool_calls"] = tool_calls
