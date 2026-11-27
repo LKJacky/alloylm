@@ -254,7 +254,7 @@ class SwaCacheManager(Cache):
         else:
             self.max_length = 1000**3  # no length limitation for window attention
         get_engine_logger().info(
-            f"Init Cache for {self.total_num_blocks * self.block_size} tokens, up to length of {self.max_length} , max decode batch size {self.max_batch_size}"
+            f"Init Cache for {self.total_num_blocks * self.block_size} tokens, up to length of {self.max_length} , max decode batch size {self.max_batch_size}, ws={self.window_size}"
         )
 
         InferKernel.init_buffer(
